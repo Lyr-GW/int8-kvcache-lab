@@ -10,7 +10,7 @@ if [[ -f "${PROJECT_DIR}/configs/versions.env" ]]; then
 fi
 VLLM_DIR="${VLLM_DIR:-/content/vllm-source}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
-VLLM_REF="${VLLM_REF:-8df14cfc8}"
+VLLM_REF="${VLLM_REF:-refs/tags/v0.6.6}"
 
 python - <<'PY'
 import torch
@@ -30,7 +30,7 @@ if [[ ! -d "${VLLM_DIR}/.git" ]]; then
   git clone --filter=blob:none "${VLLM_REPO}" "${VLLM_DIR}"
 fi
 git -C "${VLLM_DIR}" fetch --depth=1 origin "${VLLM_REF}"
-git -C "${VLLM_DIR}" checkout --detach "${VLLM_REF}"
+git -C "${VLLM_DIR}" checkout --detach FETCH_HEAD
 echo "vLLM source reference: $(git -C "${VLLM_DIR}" rev-parse HEAD)"
 
 cd "${PROJECT_DIR}"
