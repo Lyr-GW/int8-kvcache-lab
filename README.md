@@ -26,6 +26,12 @@ fused kernels are deliberately out of scope.
    in `configs/versions.env` for source comparison only, runs tests, the
    synthetic benchmark, and Qwen PPL evaluation.
 
+Before installation, the bootstrap script removes `torchvision` when it is
+present. This text-only project does not use it, while some Colab images ship a
+`torchvision` wheel compiled for a different PyTorch build. Keeping that wheel
+can make Transformers fail in optional image imports before Qwen loads. The
+cleanup is a no-op when `torchvision` is absent.
+
 The notebook never installs or patches vLLM. The adapter is built around the
 eager Qwen2 API from the pinned dependency range and fails explicitly if that
 contract changes.

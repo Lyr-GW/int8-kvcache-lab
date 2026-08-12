@@ -24,6 +24,19 @@ if properties.total_memory < minimum:
 PY
 
 python -m pip install --upgrade pip
+
+# Qwen text evaluation does not use torchvision.  Colab images can contain a
+# torchvision wheel built against a different Torch release; Transformers may
+# import its optional image helpers and fail before the language model loads.
+# Remove it before installing the project, while remaining harmless on images
+# where torchvision is not present.
+if python -m pip show torchvision >/dev/null 2>&1; then
+  echo "Removing torchvision: it is unused here and can be incompatible with Colab's Torch build."
+  python -m pip uninstall --yes torchvision
+else
+  echo "torchvision is not installed; no compatibility cleanup needed."
+fi
+
 python -m pip install -e "${PROJECT_DIR}[dev]"
 
 if [[ ! -d "${VLLM_DIR}/.git" ]]; then
