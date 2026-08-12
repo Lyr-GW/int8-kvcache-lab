@@ -11,6 +11,17 @@ layout `[num_blocks, block_size, 2, num_kv_heads, head_dim]` and implements:
 - an opt-in Qwen2.5 Transformers adapter for batch-one decode;
 - teacher-forced WikiText-2 PPL and JSON experiment reports.
 
+It also provides the two prerequisite calibration stages in a **separate,
+ABI-matched vLLM runtime**:
+
+- a real Qwen2.5-7B vLLM decode observer that saves the valid logical KV cache
+  for every layer, together with the real page table and sequence length;
+- a calibration report comparing per-tensor, per-head, per-token, and
+  per-channel symmetric INT8 reconstruction error and FP32 scale overhead;
+- a CUDA integration test that invokes vLLM v0.6.6's native
+  `PagedAttention.forward_decode` FP operator and compares it with both the
+  lab FP reference and the dynamic INT8 PyTorch implementation.
+
 The dynamic path recomputes scales, quantizes the full FP cache, and creates a
 temporary INT8 cache on every decode step. It validates numerical behavior,
 but is **not expected to outperform FP16**. Static write-time quantization and
@@ -32,9 +43,39 @@ present. This text-only project does not use it, while some Colab images ship a
 can make Transformers fail in optional image imports before Qwen loads. The
 cleanup is a no-op when `torchvision` is absent.
 
-The notebook never installs or patches vLLM. The adapter is built around the
-eager Qwen2 API from the pinned dependency range and fails explicitly if that
-contract changes.
+The main notebook never installs or patches vLLM. The adapter is built around
+the eager Qwen2 API from the pinned dependency range and fails explicitly if
+that contract changes.
+
+## Stage 1 and 2: vLLM capture and operator oracle
+
+Open `notebooks/colab_vllm_capture.py` as a Colab notebook (Colab also imports
+the `# %%` cell markers), select an A100 GPU, set `REPO_URL`, and run all cells.
+This is intentionally a **fresh runtime**, not a continuation of the dynamic
+PPL notebook: vLLM 0.6.6 requires the Torch 2.5.1 / torchvision ABI while the
+text-only dynamic path uses a newer Torch range.
+
+The cells execute, in order:
+
+```bash
+bash scripts/install_vllm_capture.sh
+python -m int8_kvcache_lab.vllm_capture --output artifacts/vllm-qwen-kv-cache.pt
+python -m int8_kvcache_lab.kv_analysis --capture artifacts/vllm-qwen-kv-cache.pt
+pytest -q tests/test_vllm_operator.py
+```
+
+`vllm_capture` observes `ModelRunner.execute_model` in process, immediately
+after an eager decode forward. It does not patch vLLM source. Only the blocks
+addressed by the decode `block_tables` and the logical token range in
+`seq_lens_tensor` are gathered, so unused preallocated pages never distort the
+distribution. The artifact uses this lab's canonical logical layout
+`[tokens, 2, kv_heads, head_dim]` for each transformer layer.
+
+The calibration report makes a recommendation by choosing the least-scale-cost
+candidate that meets a configurable relative-L2 reconstruction target (default
+1%). Treat it as a data-backed starting point, then validate the recommended
+granularity with the model-level PPL experiment. It does not silently switch
+the stage-3 dynamic path away from its documented per-head KV quantization.
 
 ## Local commands
 
@@ -43,6 +84,14 @@ python -m pip install -e '.[dev]'
 pytest -n 4 -q
 python benchmarks/benchmark_dynamic.py
 python -m int8_kvcache_lab.evaluation --samples 4 --context 128
+```
+
+With the optional vLLM capture runtime installed:
+
+```bash
+python -m int8_kvcache_lab.vllm_capture --output artifacts/vllm-qwen-kv-cache.pt
+python -m int8_kvcache_lab.kv_analysis --capture artifacts/vllm-qwen-kv-cache.pt
+pytest -q tests/test_vllm_operator.py
 ```
 
 Tests run on CPU where possible. Benchmarking and the model evaluation require

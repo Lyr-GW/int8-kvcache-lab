@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-xdist>=3.5"]
+# Do not add vLLM here: vLLM 0.6.6 pins a different Torch stack.  The optional
+# capture runtime is installed by scripts/install_vllm_capture.sh instead.
 
 [tool.setuptools.packages.find]
 where = ["src"]
