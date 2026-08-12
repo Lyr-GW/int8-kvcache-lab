@@ -20,6 +20,51 @@ DIAGNOSTIC_PROMPTS = (
 )
 
 
+def _select_model_dtype() -> torch.dtype:
+    """Prefer the checkpoint's BF16-friendly execution dtype when CUDA supports it."""
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _assert_finite(value: torch.Tensor, *, kind: str, sample_index: int, token_index: int) -> None:
+    """Reject invalid model outputs before they become a meaningless PPL."""
+    if bool(torch.isfinite(value).all()):
+        return
+    invalid = int((~torch.isfinite(value)).sum().item())
+    raise RuntimeError(
+        f"non-finite {kind}: sample_index={sample_index}, token_index={token_index}, "
+        f"shape={tuple(value.shape)}, invalid_values={invalid}"
+    )
+
+
+def _next_token_loss(
+    logits: torch.Tensor, target: torch.Tensor, *, sample_index: int, token_index: int
+) -> float:
+    """Compute one teacher-forced loss with actionable finite-value checks."""
+    next_logits = logits[:, -1].float()
+    _assert_finite(next_logits, kind="logits", sample_index=sample_index, token_index=token_index)
+    loss = F.cross_entropy(next_logits, target)
+    _assert_finite(loss, kind="loss", sample_index=sample_index, token_index=token_index)
+    return float(loss.item())
+
+
+def _perplexity(losses: list[float], *, label: str) -> float:
+    """Convert checked token losses to finite perplexity."""
+    if not losses:
+        raise RuntimeError(f"cannot calculate {label} PPL: evaluation produced no token losses")
+    mean_loss = sum(losses) / len(losses)
+    if not math.isfinite(mean_loss):
+        raise RuntimeError(f"cannot calculate {label} PPL: mean loss is non-finite ({mean_loss!r})")
+    try:
+        perplexity = math.exp(mean_loss)
+    except OverflowError as error:
+        raise RuntimeError(f"cannot calculate {label} PPL: exp(mean_loss={mean_loss!r}) overflowed") from error
+    if not math.isfinite(perplexity):
+        raise RuntimeError(f"cannot calculate {label} PPL: result is non-finite ({perplexity!r})")
+    return perplexity
+
+
 def _token_stream(tokenizer, samples: int) -> Iterable[torch.Tensor]:
     """Yield a deterministic WikiText-2 token stream without hidden shuffling."""
     from datasets import load_dataset
@@ -39,20 +84,53 @@ def _token_stream(tokenizer, samples: int) -> Iterable[torch.Tensor]:
 
 
 @torch.inference_mode()
-def _losses(model, tokens: torch.Tensor, device: torch.device, context: int) -> list[float]:
-    """Score native prefill followed by teacher-forced decode tokens."""
+def _losses(
+    model, tokens: torch.Tensor, device: torch.device, context: int, sample_index: int = 0
+) -> list[float]:
+    """Score prefill then cached teacher-forced decode with explicit cache metadata."""
+    if context < 1:
+        raise ValueError(f"context must be at least 1, got {context}")
+    if tokens.numel() < 2:
+        raise ValueError(f"sample_index={sample_index} needs at least two tokens, got {tokens.numel()}")
     losses: list[float] = []
     start = min(context, tokens.numel() - 1)
     prefill = tokens[:start].unsqueeze(0).to(device)
-    prefill_output = model(input_ids=prefill, use_cache=True)
+    prefill_mask = torch.ones((1, start), dtype=torch.long, device=device)
+    prefill_position = torch.arange(start, dtype=torch.long, device=device)
+    prefill_output = model(
+        input_ids=prefill,
+        attention_mask=prefill_mask,
+        cache_position=prefill_position,
+        use_cache=True,
+    )
     cache = prefill_output.past_key_values
-    losses.append(float(F.cross_entropy(prefill_output.logits[:, -1].float(), tokens[start : start + 1].to(device)).item()))
+    losses.append(
+        _next_token_loss(
+            prefill_output.logits,
+            tokens[start : start + 1].to(device),
+            sample_index=sample_index,
+            token_index=start,
+        )
+    )
     for token_index in range(start, tokens.numel() - 1):
         input_id = tokens[token_index : token_index + 1].view(1, 1).to(device)
-        output = model(input_ids=input_id, past_key_values=cache, use_cache=True)
+        # Transformers 4.48 Qwen2 uses the mask length as the causal-mask
+        # target length.  Supplying the complete prefix prevents it from
+        # inferring an extra future cache slot during one-token decode.
+        decode_mask = torch.ones((1, token_index + 1), dtype=torch.long, device=device)
+        decode_position = torch.tensor([token_index], dtype=torch.long, device=device)
+        output = model(
+            input_ids=input_id,
+            attention_mask=decode_mask,
+            past_key_values=cache,
+            cache_position=decode_position,
+            use_cache=True,
+        )
         cache = output.past_key_values
         target = tokens[token_index + 1 : token_index + 2].to(device)
-        losses.append(float(F.cross_entropy(output.logits[:, -1].float(), target).item()))
+        losses.append(
+            _next_token_loss(output.logits, target, sample_index=sample_index, token_index=token_index + 1)
+        )
     return losses
 
 
@@ -62,19 +140,51 @@ def _decode_diagnostics(model, tokenizer, device: torch.device, adapter: QwenDyn
     diagnostics = []
     previous_enabled = adapter.enabled
     try:
-        for prompt in DIAGNOSTIC_PROMPTS:
+        for sample_index, prompt in enumerate(DIAGNOSTIC_PROMPTS):
             input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+            prompt_length = input_ids.shape[1]
+            prompt_mask = torch.ones((1, prompt_length), dtype=torch.long, device=device)
+            prompt_position = torch.arange(prompt_length, dtype=torch.long, device=device)
+            decode_mask = torch.ones((1, prompt_length + 1), dtype=torch.long, device=device)
+            decode_position = torch.tensor([prompt_length], dtype=torch.long, device=device)
             adapter.enabled = False
-            baseline_prefill = model(input_ids=input_ids, use_cache=True)
+            baseline_prefill = model(
+                input_ids=input_ids,
+                attention_mask=prompt_mask,
+                cache_position=prompt_position,
+                use_cache=True,
+            )
+            _assert_finite(baseline_prefill.logits, kind="diagnostic baseline prefill logits", sample_index=sample_index, token_index=prompt_length)
             forced_token = baseline_prefill.logits[:, -1].argmax(dim=-1, keepdim=True)
-            baseline_step = model(input_ids=forced_token, past_key_values=baseline_prefill.past_key_values, use_cache=True)
-            baseline_generated = model.generate(input_ids, do_sample=False, max_new_tokens=16)
+            baseline_step = model(
+                input_ids=forced_token,
+                attention_mask=decode_mask,
+                past_key_values=baseline_prefill.past_key_values,
+                cache_position=decode_position,
+                use_cache=True,
+            )
+            _assert_finite(baseline_step.logits, kind="diagnostic baseline decode logits", sample_index=sample_index, token_index=prompt_length + 1)
+            baseline_generated = model.generate(input_ids, attention_mask=prompt_mask, do_sample=False, max_new_tokens=16)
 
             adapter.enabled = True
-            candidate_prefill = model(input_ids=input_ids, use_cache=True)
-            candidate_step = model(input_ids=forced_token, past_key_values=candidate_prefill.past_key_values, use_cache=True)
-            candidate_generated = model.generate(input_ids, do_sample=False, max_new_tokens=16)
+            candidate_prefill = model(
+                input_ids=input_ids,
+                attention_mask=prompt_mask,
+                cache_position=prompt_position,
+                use_cache=True,
+            )
+            _assert_finite(candidate_prefill.logits, kind="diagnostic candidate prefill logits", sample_index=sample_index, token_index=prompt_length)
+            candidate_step = model(
+                input_ids=forced_token,
+                attention_mask=decode_mask,
+                past_key_values=candidate_prefill.past_key_values,
+                cache_position=decode_position,
+                use_cache=True,
+            )
+            _assert_finite(candidate_step.logits, kind="diagnostic candidate decode logits", sample_index=sample_index, token_index=prompt_length + 1)
+            candidate_generated = model.generate(input_ids, attention_mask=prompt_mask, do_sample=False, max_new_tokens=16)
             delta = candidate_step.logits[:, -1].float() - baseline_step.logits[:, -1].float()
+            _assert_finite(delta, kind="diagnostic logit delta", sample_index=sample_index, token_index=prompt_length + 1)
             baseline_text = tokenizer.decode(baseline_generated[0], skip_special_tokens=True)
             candidate_text = tokenizer.decode(candidate_generated[0], skip_special_tokens=True)
             diagnostics.append(
@@ -94,23 +204,37 @@ def _decode_diagnostics(model, tokenizer, device: torch.device, adapter: QwenDyn
 
 def evaluate(model_name: str, samples: int, context: int, output_dir: str) -> int:
     """Run baseline then dynamic decode PPL and return a process status."""
+    if samples < 1:
+        raise ValueError(f"samples must be at least 1, got {samples}")
+    if context < 1:
+        raise ValueError(f"context must be at least 1, got {context}")
     if not torch.cuda.is_available():
         raise RuntimeError("Qwen evaluation requires a CUDA runtime")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = torch.device("cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, attn_implementation="eager").to(device).eval()
+    model_dtype = _select_model_dtype()
+    print(f"loading {model_name} with {model_dtype}")
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype, attn_implementation="eager").to(device).eval()
     streams = list(_token_stream(tokenizer, samples))
     if not streams:
         raise RuntimeError("WikiText-2 did not produce any evaluation token streams")
-    baseline = [loss for stream in streams for loss in _losses(model, stream, device, context)]
+    baseline = [
+        loss
+        for sample_index, stream in enumerate(streams)
+        for loss in _losses(model, stream, device, context, sample_index)
+    ]
     adapter = QwenDynamicKVAdapter()
     adapter.install(model)
-    candidate = [loss for stream in streams for loss in _losses(model, stream, device, context)]
+    candidate = [
+        loss
+        for sample_index, stream in enumerate(streams)
+        for loss in _losses(model, stream, device, context, sample_index)
+    ]
     diagnostics = _decode_diagnostics(model, tokenizer, device, adapter)
-    baseline_ppl = math.exp(sum(baseline) / len(baseline))
-    candidate_ppl = math.exp(sum(candidate) / len(candidate))
+    baseline_ppl = _perplexity(baseline, label="baseline")
+    candidate_ppl = _perplexity(candidate, label="candidate")
     relative_change = candidate_ppl / baseline_ppl - 1.0
     report = write_report(
         {
