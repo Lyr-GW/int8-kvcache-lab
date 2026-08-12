@@ -49,8 +49,9 @@ that contract changes.
 
 ## Stage 1 and 2: vLLM capture and operator oracle
 
-Open `notebooks/colab_vllm_capture.py` as a Colab notebook (Colab also imports
-the `# %%` cell markers), select an A100 GPU, set `REPO_URL`, and run all cells.
+Open `notebooks/colab_vllm_capture.ipynb`, select an A100 GPU, set `REPO_URL`,
+and run all cells. The adjacent `.py` file contains the same cells in a
+diff-friendly form.
 This is intentionally a **fresh runtime**, not a continuation of the dynamic
 PPL notebook: vLLM 0.6.6 requires the Torch 2.5.1 / torchvision ABI while the
 text-only dynamic path uses a newer Torch range.
