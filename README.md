@@ -33,9 +33,9 @@ Use **two fresh runtimes**. vLLM 0.6.6 and the dynamic-Qwen path pin different
 Torch ABIs; do not install them in the same session.
 
 1. **Learning / dynamic INT8 (Runtime A, ≥24 GiB L4/A100):** open
-   `notebooks/colab_int8_learn.ipynb`. It installs this package only, walks a
-   synthetic INT8 paged-attention step, then runs the official Qwen PPL
-   evaluation. Do not install vLLM here.
+   `notebooks/colab_int8_learn.ipynb`. Each code cell locates the clone via
+   `scripts/colab_runtime.py` and installs into the *current kernel* (do not
+   rely on `!python`). Do not install vLLM here.
 2. **One-shot bootstrap + PPL:** `notebooks/colab_int8_kvcache.ipynb` still runs
    `scripts/bootstrap_colab.sh` end-to-end. Clone into `/content/project` (the
    repository root). Qwen2.5-7B in FP16 is intentionally rejected on smaller

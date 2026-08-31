@@ -1,95 +1,124 @@
 # %% [markdown]
 # # INT8 KV Cache Lab — 学习 / 开发 Colab（Runtime A）
 #
-# 这份 notebook 用来 **学习动态 INT8 KV**，不是再写一遍 FP16 NaN 排查循环。
+# 这份 notebook 用来 **学习动态 INT8 KV**。每个代码 cell 都可以单独跑：会自己找仓库、把包装进**当前内核**，并用 `sys.executable`（不要用可能不一致的 `!python`）。
 #
 # **Runtime 要求**
 #
-# - 本文件：GPU **≥ 24 GiB**（L4 / A100）。**不要安装 vLLM**。
-# - Capture / 标定 / operator oracle：必须 **Disconnect and delete runtime** 后，另开 A100，打开 `notebooks/colab_vllm_capture.ipynb`。
+# - 本文件：GPU **≥ 24 GiB** 才能跑 Qwen PPL。合成 INT8（第 3 步）不强制 24 GiB。
+# - **不要安装 vLLM**。Capture 必须另开 A100，打开 `notebooks/colab_vllm_capture.ipynb`。
 #
-# **相对仓库官方评估脚本的差别**
-#
-# - 不先跑 `bootstrap_colab.sh` 全流程（它会立刻 pytest + benchmark + 7B PPL）。
-# - 按「算子 → 合成 attention → 官方 PPL → 读报告」学习。
-# - 禁止手写 teacher-forced 循环；PPL 只走 `int8_kvcache_lab.evaluation`。
-#
-# ---
-#
-# ## 你当前 notebook 要怎么改
-#
-# | 现有内容 | 处理 |
-# |---|---|
-# | `fix_script` / 替换 `git checkout 8df14cfc8` | **整段删除**。当前 `scripts/bootstrap_colab.sh` 没有这行。 |
-# | 对 `configs/versions.env` 做同样替换 | **删除**。 |
-# | 三份几乎相同的 WikiText decode 循环（查 `FIRST_NONFINITE`） | **全部删除**。它们没装 adapter，也没传 `cache_position`，进不了 INT8。 |
-# | `%%bash` + 再 load 一遍 7B | **删除**。模型只应加载一次。 |
-# | clone 后 `%cd /content/project/int8-kvcache-lab` | **改成** `%cd /content/project`。仓库根目录就是 lab。 |
-# | 最后的 `git pull` + `evaluation` | 保留评估思想，但改用下面的官方 cell；装包用本文件的 install cell。 |
-#
-# 改完应只剩：clone → install → 合成实验 / 测试 → benchmark → 官方 evaluation → 读 `artifacts`。
+# **包名说明：** `int8_kvcache_lab` 不是 Colab 预装库，源码在仓库的 `src/` 下，需要 `pip install -e .`。
 
 # %%
 import os
-import shutil
+import subprocess
+from pathlib import Path
 
 REPO_URL = "https://github.com/Lyr-GW/int8-kvcache-lab.git"
 BRANCH = "main"
-PROJECT = "/content/project"
+PROJECT = Path("/content/project")
 
-if os.path.exists(PROJECT):
-    shutil.rmtree(PROJECT)
-
-# Colab magics: clone into the repo root (this lab is not nested).
-!git clone --depth 1 --branch {BRANCH} {REPO_URL} {PROJECT}
-%cd /content/project
+if (PROJECT / "src" / "int8_kvcache_lab").is_dir():
+    print("reuse existing clone", PROJECT)
+else:
+    if PROJECT.exists():
+        raise SystemExit(f"{PROJECT} 已存在但不是本仓库，请改名。不要 rm -rf，以免打断正在进行的模型下载。")
+    subprocess.check_call(["git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, str(PROJECT)])
+os.chdir(PROJECT)
+print("cwd", Path.cwd())
 
 # %% [markdown]
 # ## 1. 安装学习环境（不跑 7B，不装 vLLM）
 #
-# 只做：CUDA / VRAM 检查、卸掉可能冲突的 `torchvision`、`pip install -e .[dev]`。
-# vLLM 源码对照可选，学习 INT8 不必 checkout。
+# 卸载可能冲突的 `torchvision`，再用**当前内核**的 interpreter 做 editable install。
+# VRAM 不足时只警告，仍允许跑第 2–3 步。
 
 # %%
+import runpy
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 
-if not torch.cuda.is_available():
-    raise SystemExit("需要 GPU。Runtime → Change runtime type → L4/A100。")
-props = torch.cuda.get_device_properties(0)
-print(f"GPU={props.name}  VRAM={props.total_memory / 1024**3:.1f} GiB  CUDA={torch.version.cuda}")
-if props.total_memory < 24 * 1024**3:
-    raise SystemExit("Qwen2.5-7B PPL 需要 ≥24 GiB。换 L4/A100，或先只跑下面的合成实验。")
 
-import subprocess, sys
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先跑 clone cell，目标目录是 /content/project。")
+
+
+ROOT = _bootstrap_lab(with_deps=True)
+
+if not torch.cuda.is_available():
+    print("警告: 没有 CUDA。第 3 步可在 CPU 跑，PPL / benchmark 需要 GPU。")
+else:
+    props = torch.cuda.get_device_properties(0)
+    print(f"GPU={props.name}  VRAM={props.total_memory / 1024**3:.1f} GiB  CUDA={torch.version.cuda}")
+    if props.total_memory < 24 * 1024**3:
+        print("警告: Qwen2.5-7B PPL 需要 ≥24 GiB。第 5 步会失败，先做第 2–3 步。")
+
 if subprocess.run([sys.executable, "-m", "pip", "show", "torchvision"], capture_output=True).returncode == 0:
     subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "torchvision"])
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", ".[dev]"])
-print("install ok", sys.executable)
+
+print("install ok", sys.executable, "cwd", ROOT)
 
 # %% [markdown]
-# ## 2. CPU 单测：先确认量化 / paged attention 契约
+# ## 2. CPU 单测
 #
-# 这些测试不加载 Qwen。失败的话后面的 PPL 没有意义。
+# 不加载 Qwen。必须用当前内核的 `sys.executable`，`!python` 在部分 Colab 镜像上不是同一个环境。
 
 # %%
-!python -m pytest -q tests/test_quantization.py tests/test_paged_attention.py tests/test_evaluation.py tests/test_kv_analysis.py
+import runpy
+import sys
+from pathlib import Path
+
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先跑 clone cell。")
+
+ROOT = _bootstrap_lab(with_deps=True)
+runpy.run_path(str(ROOT / "scripts" / "colab_runtime.py"))["run_python"](
+    "-m", "pytest", "-q",
+    "tests/test_quantization.py",
+    "tests/test_paged_attention.py",
+    "tests/test_evaluation.py",
+    "tests/test_kv_analysis.py",
+)
 
 # %% [markdown]
 # ## 3. 合成数据走一遍动态 INT8（本实验的核心）
 #
-# 对应代码：
-#
-# - `quantization.py`：`per_tensor_scale(Q)`，`per_head_scale(K/V)` + `valid_mask`
-# - `paged_cache.py`：物理布局 `[blocks, block_size, 2, kv_heads, head_dim]`
-# - `attention.py`：全量 absmax → 临时 INT8 cache → dequant 再算 attention
-#
-# 动态路径 **不会** 让 FP cache 消失；INT8 是每步临时的。因此总显存不会减半。
+# 对应代码：`quantization.py`、`paged_cache.py`、`attention.py`。
+# Q 为 per-tensor scale，K/V 为 per-head scale。FP cache 仍常驻。
+# 可在 Colab 直接跑；缺包时会自动 `pip install -e --no-deps`，不会删模型缓存。
 
 # %%
 import math
+import runpy
+from pathlib import Path
+
 import torch
+
+
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先 clone 到 /content/project。")
+
+
+ROOT = _bootstrap_lab()
+
 from int8_kvcache_lab import PagedKVCache, QuantConfig, paged_attention_dynamic_int8, paged_attention_reference
-from int8_kvcache_lab.quantization import per_head_scale, per_tensor_scale, quantize_symmetric_int8, dequantize_int8
+from int8_kvcache_lab.quantization import dequantize_int8, per_head_scale, per_tensor_scale, quantize_symmetric_int8
 
 torch.manual_seed(0)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,7 +133,6 @@ cache.write(
     torch.randn(seq_len, kv_heads, dim, device=device, dtype=torch.float16),
     slots,
 )
-# 在最后一个 page 塞一个极大值，但 valid_mask 不应覆盖它。
 cache.values[-1, -1, 0, 0, 0] = 999.0
 
 query = torch.randn(batch, q_heads, dim, device=device, dtype=torch.float16)
@@ -138,48 +166,73 @@ print("query_roundtrip_rel_l2", float((q_back.float() - query.float()).norm() / 
 # %% [markdown]
 # ## 4. 合成 benchmark（预期 INT8 更慢）
 #
-# 报告字段：`attention_relative_l2_error`、`fp16_ms`、`dynamic_int8_ms`、cache/scale 字节。
-# 慢是因为每步 findmax + 全 cache 量化 + 临时分配，不是 fused INT8 kernel。
+# 每步含 findmax + 全 cache 量化 + 临时分配，不是 fused INT8 kernel。
 
 # %%
-!python benchmarks/benchmark_dynamic.py --batch 4 --seq-len 1024 --repeat 50
+import runpy
+from pathlib import Path
+
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先 clone 到 /content/project。")
+
+ROOT = _bootstrap_lab()
+runpy.run_path(str(ROOT / "scripts" / "colab_runtime.py"))["run_python"](
+    "benchmarks/benchmark_dynamic.py", "--batch", "4", "--seq-len", "1024", "--repeat", "50"
+)
 
 # %% [markdown]
 # ## 5. 官方 Qwen PPL（唯一允许的模型评估 cell）
 #
-# **不要**再写 `model(input_ids=...)` 手搓循环。官方 `_losses` 会传：
-#
-# - 完整 prefix `attention_mask`
-# - 精确 `cache_position`
-# - 先 baseline，再 `QwenDynamicKVAdapter.install` 后的 candidate
-#
-# 质量门：candidate PPL 相对 baseline 涨幅 `<= 1%`。
-# dtype 由 `_select_model_dtype()` 选择（支持则 BF16），不要写死 FP16。
+# 不要手写 teacher-forced 循环。官方 `_losses` 会传完整 prefix mask 和 `cache_position`。
 
 # %%
+import runpy
+from pathlib import Path
+
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先 clone 到 /content/project。")
+
+ROOT = _bootstrap_lab()
 from int8_kvcache_lab.evaluation import evaluate
 
 status = evaluate(
     "Qwen/Qwen2.5-7B-Instruct",
     samples=4,
     context=128,
-    output_dir="artifacts",
+    output_dir=str(ROOT / "artifacts"),
 )
 print("evaluate_status", status, "(0=pass, 2=PPL gate failed)")
 
 # %% [markdown]
 # ## 6. 读本 runtime 已收集的数据
 #
-# 应能看到两类 JSON：
-#
-# - `kind=dynamic_int8_benchmark`
-# - `kind=qwen_dynamic_int8_ppl`（含 `decode_diagnostics`：logit 误差、greedy 是否一致）
+# 在仓库根目录的 `artifacts/` 下查找，不依赖你当前 Colab 的 cwd。
 
 # %%
 import json
+import runpy
 from pathlib import Path
 
-for path in sorted(Path("artifacts").glob("run-*.json")):
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先 clone 到 /content/project。")
+
+ROOT = _bootstrap_lab()
+reports = sorted((ROOT / "artifacts").glob("run-*.json"))
+if not reports:
+    print("no artifacts yet under", ROOT / "artifacts")
+for path in reports:
     data = json.loads(path.read_text())
     kind = data.get("kind")
     print("=" * 60)
@@ -205,13 +258,24 @@ for path in sorted(Path("artifacts").glob("run-*.json")):
             )
 
 # %% [markdown]
-# ## 7. （可选）单步 adapter：确认 INT8 路径真的被调用
+# ## 7. （可选）单步 adapter
 #
-# 仅在跳过第 5 步、或想确认 adapter 门控真的 patch 了各层时运行。会再加载 7B。
-# 第 5 步已成功则跳过。当前 adapter 丢弃 attention stats；scale 请看第 3 步合成实验。
-# 门控：`batch=1`、`seq=1`、`past_key_value` 非空，否则仍走原版 attention。
+# 第 5 步已成功则跳过。本 cell 自备 `torch` import，不依赖前面格子的变量。
 
 # %%
+import runpy
+from pathlib import Path
+
+import torch
+
+def _bootstrap_lab(*, with_deps: bool = False):
+    for root in (Path("/content/project"), Path("/content/project/int8-kvcache-lab"), Path.cwd(), Path.cwd().parent):
+        helper = root / "scripts" / "colab_runtime.py"
+        if helper.is_file():
+            return runpy.run_path(str(helper))["ensure_lab"](with_deps=with_deps)
+    raise FileNotFoundError("未找到仓库。请先 clone 到 /content/project。")
+
+ROOT = _bootstrap_lab()
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from int8_kvcache_lab.evaluation import _select_model_dtype
 from int8_kvcache_lab.qwen_adapter import QwenDynamicKVAdapter
@@ -249,7 +313,7 @@ with torch.inference_mode():
         use_cache=True,
     )
 print("adapter_decode_finite", bool(torch.isfinite(decode.logits).all()))
-print("next_token", tokenizer.decode(decode.logits[:, -1].argmax(dim=-1).item()))
+print("next_token", tokenizer.decode(int(decode.logits[:, -1].argmax(dim=-1).item())))
 print("layers_patched", len(adapter._original_forwards))
 del model, adapter, prefill, decode
 torch.cuda.empty_cache()
@@ -260,14 +324,5 @@ torch.cuda.empty_cache()
 # `Runtime → Disconnect and delete runtime`，换 **A100**，打开
 # `notebooks/colab_vllm_capture.ipynb`。
 #
-# 必须带走的数据：
-#
-# | 文件 | 看什么 |
-# |---|---|
-# | `artifacts/vllm-qwen-kv-cache.pt` | 每层逻辑 KV `[tokens, 2, kv_heads, head_dim]` |
-# | calibration JSON `recommendation` | 最便宜且 rel-L2≤1% 的粒度；**不会改** Runtime A 的 per-head 路径 |
-# | `candidates.*.relative_l2` / `scale_bytes_fp32` | per_tensor / per_head / per_token / per_channel 的误差与 scale 开销 |
-# | `distribution.key/value.percentiles` | p50/p90/p99/p999/absmax，解释 outlier |
-# | operator pytest | vLLM FP vs lab FP（≤2%）vs dynamic INT8（相对 native ≤5%） |
-#
-# 标定报告只指导「静态量化以后可能选哪种粒度」。当前 dynamic 路径仍然是 **Q per-tensor、K/V per-head、每 decode 步临时 INT8**。
+# 必须带走的数据：真实 KV `.pt`、四粒度 `relative_l2` / `scale_bytes`、K/V percentile、operator pytest。
+# 标定**不会改** Runtime A 的 per-head 路径。
