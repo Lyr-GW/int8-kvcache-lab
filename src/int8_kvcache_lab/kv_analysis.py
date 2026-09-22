@@ -18,7 +18,7 @@ from typing import Any, Iterable
 import torch
 
 from .quantization import INT8_MAX
-from .reporting import write_report
+from .reporting import to_jsonable, write_report
 
 
 _CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel")
@@ -26,6 +26,31 @@ _CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel")
 # channel needs a scale that follows head_dim. 8x is a starting threshold,
 # not a property of the model.
 _WITHIN_HEAD_CHANNEL_RATIO = 8.0
+# ``layers`` is the analyzed matrix; ``steps`` is the raw per-step tape that
+# stage 3 replays. Both are far too large for a JSON report, so the report
+# keeps only the scalar provenance of the capture.
+_TENSOR_PAYLOAD_KEYS = ("layers", "steps")
+
+
+def _capture_metadata(capture: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a capture's provenance to scalars a JSON report can carry.
+
+    The capture dict holds tensors (``block_tables``) and the whole step tape
+    under ``steps``; embedding either one makes the report unencodable and
+    enormous. Tensors outside those keys are summarized by shape and dtype.
+    """
+    metadata: dict[str, Any] = {}
+    for key, value in capture.items():
+        if key in _TENSOR_PAYLOAD_KEYS:
+            continue
+        if isinstance(value, torch.Tensor):
+            metadata[key] = {"tensor_shape": list(value.shape), "tensor_dtype": str(value.dtype)}
+        else:
+            metadata[key] = value
+    steps = capture.get("steps")
+    if isinstance(steps, list):
+        metadata["capture_step_count"] = len(steps)
+    return metadata
 
 
 def _safe_scale(absmax: torch.Tensor, eps: float) -> torch.Tensor:
@@ -202,8 +227,9 @@ def analyze_capture(
     percentile = flat[0] if flat.numel() == 1 else torch.quantile(flat, 0.999)
     outlier_ratio = float((absmax / percentile.clamp_min(1e-8)).item())
     return {
-        "capture": {key: value for key, value in capture.items() if key != "layers"},
+        "capture": _capture_metadata(capture),
         "layer_count": len(layers),
+        "kv_tokens_analyzed": int(sum(layer.shape[0] for layer in layers)),
         "relative_l2_target": relative_l2_target,
         "spread": spread,
         "outlier_ratio_absmax_over_p999": outlier_ratio,
@@ -235,8 +261,18 @@ def main() -> None:
     args = parser.parse_args()
     capture = torch.load(args.capture, map_location="cpu", weights_only=False)
     report = analyze_capture(capture, relative_l2_target=args.relative_l2_target)
+    # Print before writing: the recommendation is the result of a long GPU run,
+    # so a reporting failure must not be the only thing the run leaves behind.
+    # The print goes through to_jsonable too, or an unencodable value would
+    # abort here and cost the run the write it was moved ahead of.
+    print(json.dumps(to_jsonable(report["recommendation"]), indent=2))
+    print(
+        "relative_l2 by granularity: "
+        + ", ".join(
+            f"{name}={report['candidates'][name]['relative_l2']:.5f}" for name in _CANDIDATES
+        )
+    )
     path = write_report({"experiment": "vllm_kv_cache_calibration", **report}, args.output_dir)
-    print(json.dumps(report["recommendation"], indent=2))
     print(f"wrote {path}")
 
 
