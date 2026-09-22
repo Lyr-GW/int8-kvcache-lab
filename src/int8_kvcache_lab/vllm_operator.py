@@ -1,13 +1,18 @@
-"""Direct vLLM v0.6.6 PagedAttention operator bridge for CUDA integration tests."""
+"""Call the installed vLLM FlashAttention varlen kernel on a lab cache.
+
+This is the stage-3 kernel oracle. It targets vLLM 0.29's
+``flash_attn_varlen_func`` with a paged ``block_table``, not the v0.6.6
+``PagedAttention.forward_decode`` path.
+"""
 
 from __future__ import annotations
 
-import importlib.metadata
 import math
 
 import torch
 
 from .paged_cache import PagedKVCache
+from .vllm_runtime import load_flash_attention
 
 
 def vllm_paged_attention_decode(
@@ -16,58 +21,39 @@ def vllm_paged_attention_decode(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> torch.Tensor:
-    """Run vLLM v0.6.6's FP PagedAttention decode kernel on a lab cache.
+    """Run one decode step through ``flash_attn_varlen_func``.
 
-    This bridge is intentionally only an integration-test oracle.  It creates
-    vLLM's packed K layout and calls the installed CUDA custom op; the lab's
-    dynamic INT8 reference is then compared with this native FP output.
+    ``query`` is ``[batch, query_heads, head_dim]``. The lab cache is split
+    into the FlashAttention page layout
+    ``[blocks, block_size, kv_heads, head_dim]``.
     """
-    try:
-        version = importlib.metadata.version("vllm")
-        from vllm.attention.ops.paged_attn import PagedAttention
-    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise RuntimeError("install vLLM 0.6.6 to call its PagedAttention operator") from error
-    if version != "0.6.6":
-        raise RuntimeError(f"vLLM operator bridge requires vLLM 0.6.6, found {version}")
+    _, flash_attn_varlen_func = load_flash_attention()
     if not query.is_cuda or not cache.values.is_cuda:
-        raise ValueError("vLLM PagedAttention integration requires CUDA tensors")
+        raise ValueError("the FlashAttention oracle requires CUDA tensors")
     if cache.values.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("vLLM FP kernel comparison expects an FP16 or BF16 cache")
+        raise TypeError("the FlashAttention oracle expects an FP16 or BF16 cache")
+    if query.dtype != cache.values.dtype:
+        raise TypeError("query dtype must match the cache dtype")
     if query.shape[1] % cache.num_kv_heads:
         raise ValueError("query heads must be divisible by KV heads for GQA")
-    native = torch.empty(
-        PagedAttention.get_kv_cache_shape(cache.num_blocks, cache.block_size, cache.num_kv_heads, cache.head_dim),
-        dtype=cache.values.dtype,
-        device=cache.values.device,
-    )
-    key_cache, value_cache = PagedAttention.split_kv_cache(native, cache.num_kv_heads, cache.head_dim)
-    valid = cache.valid_mask(block_tables, seq_lens)
-    physical_slots = torch.nonzero(valid.flatten(), as_tuple=False).flatten()
-    blocks = torch.div(physical_slots, cache.block_size, rounding_mode="floor")
-    offsets = physical_slots.remainder(cache.block_size)
-    key = cache.values[blocks, offsets, 0].contiguous()
-    value = cache.values[blocks, offsets, 1].contiguous()
-    PagedAttention.write_to_paged_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        physical_slots,
-        "auto",
-        1.0,
-        1.0,
-    )
-    return PagedAttention.forward_decode(
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        seq_lens,
-        int(seq_lens.max().item()),
-        "auto",
-        cache.num_kv_heads,
-        1.0 / math.sqrt(cache.head_dim),
-        None,
-        1.0,
-        1.0,
+    if query.shape[0] != block_tables.shape[0] or query.shape[0] != seq_lens.shape[0]:
+        raise ValueError("query, block_tables, and seq_lens must share the batch size")
+
+    key_cache = cache.values[:, :, 0].contiguous()
+    value_cache = cache.values[:, :, 1].contiguous()
+    batch = query.shape[0]
+    cu_seqlens_q = torch.arange(batch + 1, device=query.device, dtype=torch.int32)
+    seqused_k = seq_lens.to(device=query.device, dtype=torch.int32)
+    block_table = block_tables.to(device=query.device, dtype=torch.int32)
+    return flash_attn_varlen_func(
+        q=query.contiguous(),
+        k=key_cache,
+        v=value_cache,
+        max_seqlen_q=1,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=int(seqused_k.max().item()),
+        seqused_k=seqused_k,
+        softmax_scale=1.0 / math.sqrt(cache.head_dim),
+        causal=True,
+        block_table=block_table,
     )

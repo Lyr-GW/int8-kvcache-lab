@@ -1,120 +1,132 @@
-"""Version-pinned, opt-in vLLM decode KV-cache capture.
+"""Capture real Q/K/V/KV-cache tensors from vLLM 0.29 FlashAttention.
 
-This module supports vLLM ``v0.6.6`` only.  It observes the cache immediately
-after a real eager decode forward, gathers only the logical tokens addressed by
-``block_tables``/``seq_lens_tensor``, and writes a CPU artifact for calibration.
-No vLLM source file is modified.
+The observer wraps ``FlashAttentionImpl.forward`` after the native kernel
+returns. It does not edit the vLLM checkout. Each recorded step keeps the
+query, the newly projected K/V, the paged K/V pages addressed by
+``block_table``, ``slot_mapping``, ``cu_seqlens``, ``seqused_k``, and the
+kernel output. Unused preallocated pages are not stored.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from .paged_cache import PagedKVCache
+from .vllm_runtime import (
+    describe_call,
+    format_call_site,
+    make_llm,
+    observe_flash_forward,
+    pack_referenced_pages,
+    split_packed_kv_cache,
+)
 
 
-SUPPORTED_VLLM_VERSION = "0.6.6"
+def _metadata_tensor(metadata: Any, *names: str) -> torch.Tensor | None:
+    for name in names:
+        value = getattr(metadata, name, None)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
 
 
-def _require_vllm() -> tuple[Any, Any, Any]:
-    """Import the pinned optional runtime with a clear incompatibility error."""
-    try:
-        version = importlib.metadata.version("vllm")
-        from vllm import LLM, SamplingParams
-        from vllm.worker.model_runner import ModelRunner
-    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
-        raise RuntimeError(
-            "vLLM capture is optional. Install the pinned runtime with "
-            "`bash scripts/install_vllm_capture.sh` in a fresh CUDA Colab runtime."
-        ) from error
-    if version != SUPPORTED_VLLM_VERSION:
-        raise RuntimeError(f"vLLM capture requires vLLM {SUPPORTED_VLLM_VERSION}, found {version}")
-    return LLM, SamplingParams, ModelRunner
+def _logical_layer(key_cache: torch.Tensor, value_cache: torch.Tensor, block_table: torch.Tensor, seqused_k: torch.Tensor) -> torch.Tensor:
+    """Gather valid K/V into ``[tokens, 2, kv_heads, head_dim]``."""
+    pieces: list[torch.Tensor] = []
+    block_size = key_cache.shape[1]
+    for row, length in enumerate(seqused_k.tolist()):
+        length = int(length)
+        if length <= 0:
+            continue
+        pages = (length + block_size - 1) // block_size
+        block_ids = block_table[row, :pages].to(dtype=torch.long)
+        key = key_cache[block_ids].reshape(-1, key_cache.shape[2], key_cache.shape[3])[:length]
+        value = value_cache[block_ids].reshape(-1, value_cache.shape[2], value_cache.shape[3])[:length]
+        pieces.append(torch.stack((key, value), dim=1))
+    if not pieces:
+        raise ValueError("capture step did not address any KV tokens")
+    return torch.cat(pieces, dim=0)
 
 
-def _canonicalize_layer(kv_cache: torch.Tensor, *, num_kv_heads: int, head_dim: int) -> torch.Tensor:
-    """Convert vLLM's v0.6.6 physical cache into this lab's canonical layout."""
-    if kv_cache.ndim == 5 and kv_cache.shape[0] == 2:
-        # FlashAttention backend: [K/V, blocks, block_size, heads, dim].
-        if kv_cache.shape[3:] != (num_kv_heads, head_dim):
-            raise ValueError(f"unexpected 5D vLLM KV shape: {tuple(kv_cache.shape)}")
-        return kv_cache.permute(1, 2, 0, 3, 4).contiguous()
-    if kv_cache.ndim == 3 and kv_cache.shape[0] == 2:
-        # PagedAttention/XFormers backend packs K as [head_dim/x, block, x].
-        element_group = 16 // kv_cache.element_size()
-        if head_dim % element_group:
-            raise ValueError("vLLM packed key cache requires head_dim divisible by 16 / element_size")
-        blocks = kv_cache.shape[1]
-        key = kv_cache[0].view(blocks, num_kv_heads, head_dim // element_group, -1, element_group)
-        value = kv_cache[1].view(blocks, num_kv_heads, head_dim, -1)
-        key = key.permute(0, 3, 1, 2, 4).reshape(blocks, key.shape[3], num_kv_heads, head_dim)
-        value = value.permute(0, 3, 1, 2).contiguous()
-        return torch.stack((key, value), dim=2)
-    raise ValueError(f"unsupported vLLM v0.6.6 KV-cache shape: {tuple(kv_cache.shape)}")
+class _ForwardRecorder:
+    """Group per-layer forward taps into decoder steps."""
 
+    def __init__(self) -> None:
+        self.call_site: dict[str, Any] | None = None
+        self.steps: list[dict[str, Any]] = []
+        self._open_key: tuple[Any, ...] | None = None
+        self._open_layers: list[dict[str, Any]] = []
 
-def _logical_layers(
-    kv_caches: list[torch.Tensor],
-    *,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    num_kv_heads: int,
-    head_dim: int,
-) -> list[torch.Tensor]:
-    """Gather only the valid logical K/V tokens, preserving all transformer layers."""
-    if block_tables.ndim != 2 or seq_lens.ndim != 1 or seq_lens.numel() != 1:
-        raise ValueError("initial capture supports exactly one decode sequence")
-    logical: list[torch.Tensor] = []
-    for layer in kv_caches:
-        physical = _canonicalize_layer(layer, num_kv_heads=num_kv_heads, head_dim=head_dim)
-        cache = PagedKVCache(physical)
-        key, value, mask = cache.gather(block_tables, seq_lens)
-        logical.append(torch.stack((key[0, mask[0]], value[0, mask[0]]), dim=1).detach().cpu())
-    return logical
-
-
-class _DecodeCapture:
-    """Small in-process observer installed around the vLLM v0.6.6 ModelRunner."""
-
-    def __init__(self, *, num_kv_heads: int, head_dim: int) -> None:
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.snapshot: dict[str, Any] | None = None
-
-    def observe(self, model_input: Any, kv_caches: list[torch.Tensor]) -> None:
-        metadata = getattr(model_input, "attn_metadata", None)
-        decode = getattr(metadata, "decode_metadata", None)
-        if decode is None:
+    def __call__(self, impl: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, kv_cache: torch.Tensor, metadata: Any, output: torch.Tensor) -> None:
+        block_table = _metadata_tensor(metadata, "block_table", "block_table_tensor")
+        seqused_k = _metadata_tensor(metadata, "seq_lens", "seqused_k")
+        cu_seqlens_q = _metadata_tensor(metadata, "query_start_loc", "cu_seqlens_q")
+        if block_table is None or seqused_k is None or cu_seqlens_q is None:
             return
-        block_tables = getattr(decode, "block_tables", None)
-        seq_lens = getattr(decode, "seq_lens_tensor", None)
-        if block_tables is None or seq_lens is None or not int(seq_lens.numel()):
-            return
-        # CUDA graphs pad metadata rows; eager single-sequence execution has one.
-        block_tables = block_tables[:1].detach()
-        seq_lens = seq_lens[:1].detach().to(dtype=torch.long)
-        self.snapshot = {
-            "format": "int8-kvcache-lab.vllm-capture.v1",
-            "vllm_version": SUPPORTED_VLLM_VERSION,
-            "block_size": int(
-                kv_caches[0].shape[2]
-                if kv_caches[0].ndim == 5
-                else kv_caches[0].shape[-1] // (self.num_kv_heads * self.head_dim)
-            ),
-            "sequence_length": int(seq_lens[0].item()),
-            "block_tables": block_tables.cpu(),
-            "layers": _logical_layers(
-                kv_caches,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-            ),
+        num_tokens = int(getattr(metadata, "num_actual_tokens", query.shape[0]))
+        key_cache, value_cache = split_packed_kv_cache(kv_cache, impl.head_size)
+        packed_key, packed_value, local_table = pack_referenced_pages(
+            key_cache, value_cache, block_table, seqused_k
+        )
+        slot_mapping = _metadata_tensor(metadata, "slot_mapping")
+        if self.call_site is None:
+            module_file = None
+            try:
+                import vllm.v1.attention.backends.flash_attn as flash_module
+
+                module_file = flash_module.__file__
+            except ImportError:
+                module_file = None
+            self.call_site = describe_call(getattr(impl, "vllm_flash_attn_version", None), module_file)
+            print(format_call_site(self.call_site))
+        causal_flag = getattr(metadata, "causal", True)
+        layer = {
+            "query": query[:num_tokens].detach().cpu(),
+            "key": key[:num_tokens].detach().cpu(),
+            "value": value[:num_tokens].detach().cpu(),
+            "key_cache": packed_key,
+            "value_cache": packed_value,
+            "block_table": local_table,
+            "slot_mapping": None if slot_mapping is None else slot_mapping.detach().cpu(),
+            "cu_seqlens_q": cu_seqlens_q.detach().cpu(),
+            "seqused_k": seqused_k.detach().cpu(),
+            "output": output[:num_tokens].detach().cpu(),
+            "causal": causal_flag if isinstance(causal_flag, bool) else "tensor",
+            "softmax_scale": float(impl.scale),
+        }
+        step_key = (tuple(seqused_k.detach().cpu().tolist()), tuple(cu_seqlens_q.detach().cpu().tolist()))
+        if step_key != self._open_key:
+            self._flush()
+            self._open_key = step_key
+        self._open_layers.append(layer)
+
+    def _flush(self) -> None:
+        if self._open_layers:
+            self.steps.append({"layers": self._open_layers})
+            self._open_layers = []
+
+    def finish(self) -> dict[str, Any]:
+        self._flush()
+        if not self.steps or self.call_site is None:
+            raise RuntimeError("vLLM finished without a FlashAttention forward that carried a block table")
+        last = self.steps[-1]["layers"]
+        logical_layers = [
+            _logical_layer(layer["key_cache"], layer["value_cache"], layer["block_table"], layer["seqused_k"])
+            for layer in last
+        ]
+        return {
+            "format": "int8-kvcache-lab.vllm-capture.v2",
+            "call_site": self.call_site,
+            "rank": int(os.environ.get("RANK", "0")),
+            "block_size": int(last[0]["key_cache"].shape[1]),
+            "sequence_length": int(last[0]["seqused_k"].max().item()),
+            "block_tables": last[0]["block_table"],
+            "layers": logical_layers,
+            "steps": self.steps,
         }
 
 
@@ -124,59 +136,65 @@ def capture_decode(
     prompt: str,
     output: Path,
     max_tokens: int = 16,
-    max_model_len: int = 1024,
+    max_model_len: int = 256,
     dtype: str = "bfloat16",
 ) -> Path:
-    """Run one Qwen decode request under vLLM and save its latest cache state."""
+    """Run one eager generate and save the FlashAttention inputs and outputs."""
     if not torch.cuda.is_available():
         raise RuntimeError("vLLM capture requires an NVIDIA CUDA GPU")
-    if max_tokens < 2:
-        raise ValueError("max_tokens must be at least 2 so a decode forward occurs")
-    LLM, SamplingParams, ModelRunner = _require_vllm()
-    config = __import__("transformers").AutoConfig.from_pretrained(model)
-    capture = _DecodeCapture(num_kv_heads=config.num_key_value_heads, head_dim=config.hidden_size // config.num_attention_heads)
-    original = ModelRunner.execute_model
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be positive")
+    from vllm import SamplingParams
 
-    def wrapped(runner: Any, model_input: Any, kv_caches: list[torch.Tensor], *args: Any, **kwargs: Any) -> Any:
-        result = original(runner, model_input, kv_caches, *args, **kwargs)
-        capture.observe(model_input, kv_caches)
-        return result
-
-    ModelRunner.execute_model = wrapped
-    try:
-        engine = LLM(
-            model=model,
-            dtype=dtype,
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            enforce_eager=True,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=0.75,
-            disable_log_stats=True,
-        )
+    recorder = _ForwardRecorder()
+    # Build the engine before installing the observer so startup profiling
+    # does not get mixed into the captured generate steps.
+    engine = make_llm(model, dtype=dtype, max_model_len=max_model_len)
+    with observe_flash_forward(recorder):
         engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
-    finally:
-        ModelRunner.execute_model = original
-    if capture.snapshot is None:
-        raise RuntimeError("vLLM completed without an observable eager decode cache snapshot")
-    capture.snapshot.update({"model": model, "dtype": dtype, "prompt_character_count": len(prompt)})
+    snapshot = recorder.finish()
+    snapshot.update({"model": model, "dtype": dtype, "prompt": prompt, "max_model_len": max_model_len})
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(capture.snapshot, output)
+    torch.save(snapshot, output)
     return output
 
 
 def main() -> None:
-    """CLI entry point used by the vLLM calibration Colab notebook."""
+    """CLI entry point used by the Colab stage-2 cell."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--prompt", default="Explain why paged KV caches improve decode throughput.")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--prompt", default="What is 17 * 23? Reply with the integer only.")
+    parser.add_argument("--dataset", choices=("prompt", "aime"), default="prompt")
     parser.add_argument("--output", type=Path, default=Path("artifacts/vllm-qwen-kv-cache.pt"))
     parser.add_argument("--max-tokens", type=int, default=16)
-    parser.add_argument("--max-model-len", type=int, default=1024)
+    parser.add_argument("--max-model-len", type=int, default=256)
     parser.add_argument("--dtype", choices=("half", "bfloat16"), default="bfloat16")
     args = parser.parse_args()
-    path = capture_decode(**vars(args))
+    prompt = args.prompt
+    if args.dataset == "aime":
+        prompt = _aime_prompt(prompt)
+    path = capture_decode(
+        model=args.model,
+        prompt=prompt,
+        output=args.output,
+        max_tokens=args.max_tokens,
+        max_model_len=args.max_model_len,
+        dtype=args.dtype,
+    )
     print(f"wrote {path}")
+
+
+def _aime_prompt(fallback: str) -> str:
+    """Load one AIME problem when the dataset is reachable, else keep the fallback."""
+    try:
+        from datasets import load_dataset
+
+        row = next(iter(load_dataset("HuggingFaceH4/aime_2024", split="train")))
+        problem = row.get("problem") or row.get("question") or fallback
+        return str(problem)
+    except Exception as error:
+        print(f"AIME dataset is unavailable ({error}); using the built-in prompt.")
+        return fallback
 
 
 if __name__ == "__main__":

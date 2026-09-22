@@ -39,22 +39,86 @@ def per_tensor_scale(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.where(amax > eps, amax / INT8_MAX, torch.ones_like(amax))
 
 
+def _positive_scale(statistic: torch.Tensor, eps: float) -> torch.Tensor:
+    """Convert a magnitude statistic into a strictly positive INT8 scale."""
+    return torch.where(statistic > eps, statistic / INT8_MAX, torch.ones_like(statistic))
+
+
+def _magnitude(values: torch.Tensor, statistic: str) -> torch.Tensor:
+    """Reduce ``values`` over the token axis.
+
+    ``values`` is ``[tokens, ...]``. ``absmax`` uses the maximum absolute
+    value. ``p999`` uses the 99.9th percentile, which clips a single outlier.
+    """
+    absolute = values.float().abs()
+    if statistic == "absmax":
+        return absolute.amax(dim=0)
+    if statistic == "p999":
+        if absolute.shape[0] == 1:
+            return absolute[0]
+        return torch.quantile(absolute, 0.999, dim=0)
+    raise ValueError("statistic must be absmax or p999")
+
+
 def per_head_scale(
     values: torch.Tensor,
     valid_mask: torch.Tensor,
     eps: float = 1e-8,
+    *,
+    statistic: str = "absmax",
 ) -> torch.Tensor:
     """Return one safe scale per KV head over valid paged tokens.
 
     Args:
         values: ``[blocks, block_size, kv_heads, head_dim]`` floating tensor.
         valid_mask: Boolean ``[blocks, block_size]`` mask. Invalid page slots
-            are excluded from the absmax reduction.
+            are excluded from the reduction. The result shape is ``[kv_heads]``.
     """
     if values.ndim != 4:
         raise ValueError("values must have shape [blocks, block_size, heads, dim]")
     if valid_mask.shape != values.shape[:2] or valid_mask.dtype != torch.bool:
         raise ValueError("valid_mask must be boolean with shape [blocks, block_size]")
-    masked = values.float().abs() * valid_mask[..., None, None]
-    amax = masked.amax(dim=(0, 1, 3))
-    return torch.where(amax > eps, amax / INT8_MAX, torch.ones_like(amax))
+    selected = values.reshape(-1, values.shape[2], values.shape[3])[valid_mask.reshape(-1)]
+    if selected.numel() == 0:
+        return torch.ones(values.shape[2], dtype=torch.float32, device=values.device)
+    return _positive_scale(_magnitude(selected, statistic).amax(dim=-1), eps)
+
+
+def per_channel_scale(
+    values: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+    *,
+    statistic: str = "absmax",
+) -> torch.Tensor:
+    """Return one scale per ``(kv_head, head_dim)`` over valid tokens.
+
+    The result shape is ``[kv_heads, head_dim]``. This scale depends on the
+    axis that QK reduces, so an INT8 GEMM cannot factor it out of the dot
+    product. Fold it into Q instead.
+    """
+    if values.ndim != 4:
+        raise ValueError("values must have shape [blocks, block_size, heads, dim]")
+    if valid_mask.shape != values.shape[:2] or valid_mask.dtype != torch.bool:
+        raise ValueError("valid_mask must be boolean with shape [blocks, block_size]")
+    selected = values.reshape(-1, values.shape[2], values.shape[3])[valid_mask.reshape(-1)]
+    if selected.numel() == 0:
+        return torch.ones(values.shape[2:], dtype=torch.float32, device=values.device)
+    return _positive_scale(_magnitude(selected, statistic), eps)
+
+
+def logical_kv_scale(
+    values: torch.Tensor,
+    *,
+    granularity: str,
+    statistic: str = "absmax",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Scale a gathered logical KV tensor of shape ``[tokens, kv_heads, dim]``."""
+    if values.ndim != 3:
+        raise ValueError("logical KV must have shape [tokens, kv_heads, head_dim]")
+    if granularity == "per_head":
+        return _positive_scale(_magnitude(values, statistic).amax(dim=-1), eps)
+    if granularity == "per_channel":
+        return _positive_scale(_magnitude(values, statistic), eps)
+    raise ValueError("granularity must be per_head or per_channel")

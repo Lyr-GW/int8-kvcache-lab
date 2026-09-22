@@ -1,9 +1,10 @@
 """KV-cache capture analysis and quantization-granularity calibration.
 
-The calibration data is deliberately kept separate from the dynamic runtime
-path.  It answers which *static* granularity best represents the KV values
-observed during a real vLLM decode, without silently changing the current
-per-head dynamic experiment.
+The calibration data is deliberately kept separate from the runtime path.
+It reports reconstruction error for several scale layouts and recommends
+``per_channel`` when channels inside a head differ sharply, otherwise
+``per_head``. The recommendation is an input to the stage-4/5 experiments;
+it does not rewrite ``QuantConfig`` by itself.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ from .reporting import write_report
 
 
 _CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel")
+# A head whose largest channel is at least this many times its smallest
+# channel needs a scale that follows head_dim. 8x is a starting threshold,
+# not a property of the model.
+_WITHIN_HEAD_CHANNEL_RATIO = 8.0
 
 
 def _safe_scale(absmax: torch.Tensor, eps: float) -> torch.Tensor:
@@ -28,30 +33,73 @@ def _safe_scale(absmax: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.where(absmax > eps, absmax / INT8_MAX, torch.ones_like(absmax))
 
 
-def _scale_for(values: torch.Tensor, granularity: str, eps: float) -> torch.Tensor:
+def _reduce_magnitude(absolute: torch.Tensor, dims: tuple[int, ...], statistic: str) -> torch.Tensor:
+    """Reduce ``absolute`` over ``dims`` by absmax or the 99.9th percentile."""
+    if statistic == "absmax":
+        return absolute.amax(dim=dims)
+    keep = [axis for axis in range(absolute.ndim) if axis not in dims]
+    moved = absolute.permute(*dims, *keep)
+    flat = moved.reshape(-1, *moved.shape[len(dims) :])
+    if flat.shape[0] == 1:
+        return flat[0]
+    return torch.quantile(flat, 0.999, dim=0)
+
+
+def _scale_for(
+    values: torch.Tensor,
+    granularity: str,
+    eps: float,
+    statistic: str = "absmax",
+) -> torch.Tensor:
     """Return one scale per requested KV-cache quantization group.
 
     ``values`` has canonical logical shape ``[tokens, 2, kv_heads, head_dim]``.
-    The first two granularities are per layer: K and V remain separate so that
-    their scales follow their individual distributions.
+    K and V stay separate. ``per_channel`` is one scale per
+    ``(K or V, kv_head, head_dim)`` reduced over tokens. It is not a
+    per-token scale.
     """
     if values.ndim != 4 or values.shape[1] != 2:
         raise ValueError("values must have shape [tokens, 2, kv_heads, head_dim]")
     absolute = values.float().abs()
     if granularity == "per_tensor":
-        return _safe_scale(absolute.amax(dim=(0, 2, 3)), eps)[None, :, None, None]
+        return _safe_scale(_reduce_magnitude(absolute, (0, 2, 3), statistic), eps)[None, :, None, None]
     if granularity == "per_head":
-        return _safe_scale(absolute.amax(dim=(0, 3)), eps)[None, :, :, None]
+        return _safe_scale(_reduce_magnitude(absolute, (0, 3), statistic), eps)[None, :, :, None]
     if granularity == "per_token":
-        return _safe_scale(absolute.amax(dim=(2, 3)), eps)[:, :, None, None]
+        return _safe_scale(_reduce_magnitude(absolute, (2, 3), statistic), eps)[:, :, None, None]
     if granularity == "per_channel":
-        # A token/head feature vector is the "channel" used by this lab.
-        return _safe_scale(absolute.amax(dim=3), eps)[:, :, :, None]
+        return _safe_scale(_reduce_magnitude(absolute, (0,), statistic), eps)[None]
     raise ValueError(f"unsupported granularity: {granularity}")
 
 
-def _error_for(values: torch.Tensor, granularity: str, eps: float) -> dict[str, float | int]:
-    scale = _scale_for(values, granularity, eps)
+def _spread(layers: list[torch.Tensor]) -> dict[str, float]:
+    """Compare channel spread inside a head with spread across heads."""
+    within: list[torch.Tensor] = []
+    across: list[torch.Tensor] = []
+    for layer in layers:
+        channel_absmax = layer.float().abs().amax(dim=0)
+        peak = channel_absmax.amax(dim=-1).clamp_min(1e-8)
+        floor = channel_absmax.amin(dim=-1).clamp_min(1e-8)
+        within.append((peak / floor).reshape(-1))
+        head_peak = channel_absmax.amax(dim=-1)
+        across.append((head_peak.amax(dim=-1) / head_peak.amin(dim=-1).clamp_min(1e-8)).reshape(-1))
+    within_all = torch.cat(within)
+    across_all = torch.cat(across)
+    return {
+        "within_head_max_ratio": float(within_all.max().item()),
+        "within_head_median_ratio": float(within_all.median().item()),
+        "across_head_median_ratio": float(across_all.median().item()),
+        "within_head_threshold": _WITHIN_HEAD_CHANNEL_RATIO,
+    }
+
+
+def _error_for(
+    values: torch.Tensor,
+    granularity: str,
+    eps: float,
+    statistic: str = "absmax",
+) -> dict[str, float | int]:
+    scale = _scale_for(values, granularity, eps, statistic)
     restored = (torch.round(values.float() / scale).clamp(-127, 127) * scale)
     error = restored - values.float()
     return {
@@ -116,6 +164,7 @@ def analyze_capture(
     layers = list(_iter_layers(capture))
     by_kind = {"key": [], "value": []}
     totals = {name: {"squared_error": 0.0, "squared_signal": 0.0, "max_abs_error": 0.0, "scale_count": 0} for name in _CANDIDATES}
+    p999_totals = {name: {"squared_error": 0.0, "squared_signal": 0.0} for name in _CANDIDATES}
     layer_summaries: list[dict[str, Any]] = []
     for index, layer in enumerate(layers):
         by_kind["key"].append(layer[:, 0])
@@ -127,28 +176,46 @@ def analyze_capture(
             for metric in ("squared_error", "squared_signal", "scale_count"):
                 totals[name][metric] += metrics[metric]
             totals[name]["max_abs_error"] = max(totals[name]["max_abs_error"], metrics["max_abs_error"])
+            p999_metrics = _error_for(layer, name, eps, "p999")
+            for metric in ("squared_error", "squared_signal"):
+                p999_totals[name][metric] += p999_metrics[metric]
         layer_summaries.append({"layer_index": index, "tokens": int(layer.shape[0]), "candidate_errors": candidate_errors})
 
     candidates: dict[str, Any] = {}
     for name in _CANDIDATES:
         total = totals[name]
         signal = max(float(total["squared_signal"]), 1e-20)
+        p999_signal = max(float(p999_totals[name]["squared_signal"]), 1e-20)
         candidates[name] = {
             "relative_l2": math.sqrt(float(total["squared_error"]) / signal),
+            "p999_relative_l2": math.sqrt(float(p999_totals[name]["squared_error"]) / p999_signal),
             "max_abs_error": total["max_abs_error"],
             "scale_count": int(total["scale_count"]),
             "scale_bytes_fp32": int(total["scale_count"]) * 4,
         }
-    eligible = [name for name in _CANDIDATES if candidates[name]["relative_l2"] <= relative_l2_target]
-    recommendation = eligible[0] if eligible else min(_CANDIDATES, key=lambda name: candidates[name]["relative_l2"])
+    spread = _spread(layers)
+    recommendation = (
+        "per_channel" if spread["within_head_max_ratio"] >= _WITHIN_HEAD_CHANNEL_RATIO else "per_head"
+    )
+    flat = torch.cat([layer.float().abs().reshape(-1) for layer in layers])
+    absmax = flat.amax()
+    percentile = flat[0] if flat.numel() == 1 else torch.quantile(flat, 0.999)
+    outlier_ratio = float((absmax / percentile.clamp_min(1e-8)).item())
     return {
         "capture": {key: value for key, value in capture.items() if key != "layers"},
         "layer_count": len(layers),
         "relative_l2_target": relative_l2_target,
+        "spread": spread,
+        "outlier_ratio_absmax_over_p999": outlier_ratio,
         "recommendation": {
             "kv_granularity": recommendation,
-            "meets_target": bool(eligible),
-            "rationale": "lowest scale-overhead candidate meeting the reconstruction-error target" if eligible else "no candidate met target; selected the lowest reconstruction error",
+            "scale_statistic": "p999" if outlier_ratio >= 4.0 else "absmax",
+            "meets_target": candidates[recommendation]["relative_l2"] <= relative_l2_target,
+            "rationale": (
+                "channels inside a head differ by at least the configured ratio, so the scale must follow head_dim"
+                if recommendation == "per_channel"
+                else "channels inside a head are comparable, so one scale per KV head is enough"
+            ),
         },
         "candidates": candidates,
         "distribution": {
