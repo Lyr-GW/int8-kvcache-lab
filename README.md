@@ -29,13 +29,20 @@ fused kernels are deliberately out of scope.
 
 ## Run in Google Colab
 
-1. Select a GPU runtime with at least 24 GiB VRAM (L4/A100). Qwen2.5-7B in
-   FP16 is intentionally rejected on smaller runtimes to avoid conflating an
-   out-of-memory failure with a quantization result.
-2. Open `notebooks/colab_int8_kvcache.ipynb`, set `REPO_URL`, and run it.
-3. The bootstrap script installs this package, checks out vLLM at the revision
-   in `configs/versions.env` for source comparison only, runs tests, the
-   synthetic benchmark, and Qwen PPL evaluation.
+Use **two fresh runtimes**. vLLM 0.6.6 and the dynamic-Qwen path pin different
+Torch ABIs; do not install them in the same session.
+
+1. **Learning / dynamic INT8 (Runtime A, ≥24 GiB L4/A100):** open
+   `notebooks/colab_int8_learn.ipynb`. Each code cell locates the clone via
+   `scripts/colab_runtime.py` and installs into the *current kernel* (do not
+   rely on `!python`). Do not install vLLM here.
+2. **One-shot bootstrap + PPL:** `notebooks/colab_int8_kvcache.ipynb` still runs
+   `scripts/bootstrap_colab.sh` end-to-end. Clone into `/content/project` (the
+   repository root). Qwen2.5-7B in FP16 is intentionally rejected on smaller
+   runtimes to avoid conflating an out-of-memory failure with a quantization
+   result.
+3. **Capture / calibration / operator oracle (Runtime B, A100):** disconnect
+   Runtime A and open `notebooks/colab_vllm_capture.ipynb`.
 
 Before installation, the bootstrap script removes `torchvision` when it is
 present. This text-only project does not use it, while some Colab images ship a
