@@ -1,6 +1,12 @@
 import torch
 
-from int8_kvcache_lab.quantization import dequantize_int8, per_head_scale, per_tensor_scale, quantize_symmetric_int8
+from int8_kvcache_lab.quantization import (
+    dequantize_int8,
+    per_channel_scale,
+    per_head_scale,
+    per_tensor_scale,
+    quantize_symmetric_int8,
+)
 
 
 def test_per_tensor_round_trip_and_zero_slice():
@@ -16,3 +22,13 @@ def test_per_head_ignores_invalid_outlier():
     mask = torch.tensor([[True, False]])
     scale = per_head_scale(values, mask)
     torch.testing.assert_close(scale, torch.tensor([1 / 127, 2 / 127]))
+
+
+def test_per_channel_scale_follows_head_dim_and_ignores_invalid_slots():
+    values = torch.zeros(1, 2, 1, 2)
+    values[0, 0, 0, 0] = 127.0
+    values[0, 0, 0, 1] = 1.0
+    values[0, 1, 0, :] = 1000.0
+    mask = torch.tensor([[True, False]])
+    scale = per_channel_scale(values, mask)
+    torch.testing.assert_close(scale, torch.tensor([[1.0, 1.0 / 127]]))

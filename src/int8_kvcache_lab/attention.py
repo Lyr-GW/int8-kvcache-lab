@@ -8,6 +8,7 @@ import torch
 
 from .config import QuantConfig
 from .paged_cache import PagedKVCache
+from .pytorch_ref import dequantized_attention, int8_simulated_attention
 from .quantization import per_head_scale, per_tensor_scale, quantize_symmetric_int8
 
 
@@ -97,4 +98,86 @@ def paged_attention_dynamic_int8(
         "scale_bytes": (q_scale.numel() + key_scale.numel() + value_scale.numel()) * q_scale.element_size(),
         "int8_cache_and_scale_bytes": cache.int8_bytes
         + (q_scale.numel() + key_scale.numel() + value_scale.numel()) * q_scale.element_size(),
+    }
+
+
+def _sequence_logical(
+    cache: PagedKVCache,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    length = int(seq_lens[request].item())
+    table = block_tables[request : request + 1]
+    seq = torch.tensor([length], device=cache.values.device, dtype=seq_lens.dtype)
+    key, value, _ = cache.gather(table, seq)
+    return key[0], value[0], length
+
+
+def _run_per_sequence(
+    query: torch.Tensor,
+    cache: PagedKVCache,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    config: QuantConfig,
+    runner,
+) -> torch.Tensor:
+    outputs = []
+    scale = 1.0 / math.sqrt(cache.head_dim)
+    for request in range(query.shape[0]):
+        key, value, _ = _sequence_logical(cache, block_tables, seq_lens, request)
+        outputs.append(
+            runner(
+                query[request].unsqueeze(0),
+                key,
+                value,
+                granularity=config.kv_granularity,
+                statistic=config.scale_statistic,
+                eps=config.eps,
+                softmax_scale=scale,
+                causal=True,
+            ).squeeze(0)
+        )
+    return torch.stack(outputs, dim=0)
+
+
+def attention_dequantized(
+    query: torch.Tensor,
+    cache: PagedKVCache,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    config: QuantConfig = QuantConfig(),
+) -> tuple[torch.Tensor, dict[str, str]]:
+    """Stage 4A for decode. Quantize K/V, restore them, and reuse the FP reference math."""
+    if config.block_size != cache.block_size:
+        raise ValueError("QuantConfig.block_size must equal the cache block size")
+    _validate_query(query, cache, block_tables)
+    output = _run_per_sequence(query, cache, block_tables, seq_lens, config, dequantized_attention)
+    return output, {"implementation": "dequant", "kv_granularity": config.kv_granularity}
+
+
+def attention_int8_simulated(
+    query: torch.Tensor,
+    cache: PagedKVCache,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    config: QuantConfig = QuantConfig(),
+    *,
+    quantize_probabilities: bool = False,
+) -> tuple[torch.Tensor, dict[str, str | bool]]:
+    """Stage 4B for decode. INT8 QK/PV is simulated with FP32 math over INT8 values."""
+    if config.block_size != cache.block_size:
+        raise ValueError("QuantConfig.block_size must equal the cache block size")
+    _validate_query(query, cache, block_tables)
+
+    def runner(query_piece, key, value, **kwargs):
+        return int8_simulated_attention(
+            query_piece, key, value, quantize_probabilities=quantize_probabilities, **kwargs
+        )
+
+    output = _run_per_sequence(query, cache, block_tables, seq_lens, config, runner)
+    return output, {
+        "implementation": "int8_gemm",
+        "kv_granularity": config.kv_granularity,
+        "quantize_probabilities": quantize_probabilities,
     }

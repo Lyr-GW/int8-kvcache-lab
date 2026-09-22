@@ -10,7 +10,7 @@ if [[ -f "${PROJECT_DIR}/configs/versions.env" ]]; then
 fi
 VLLM_DIR="${VLLM_DIR:-/content/vllm-source}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
-VLLM_REF="${VLLM_REF:-refs/tags/v0.6.6}"
+VLLM_REF="${VLLM_REF:-refs/tags/v0.29.0}"
 
 python - <<'PY'
 import torch

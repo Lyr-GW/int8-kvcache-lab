@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 import torch
 
-from .attention import paged_attention_dynamic_int8
+from .attention import attention_dequantized, attention_int8_simulated, paged_attention_dynamic_int8
 from .config import QuantConfig
 from .paged_cache import PagedKVCache
 
@@ -23,6 +23,7 @@ class QwenDynamicKVAdapter:
     """Patch Qwen2.5 self-attention modules only for batch-one decode."""
 
     config: QuantConfig = field(default_factory=QuantConfig)
+    implementation: str = "dynamic"
     enabled: bool = True
     disabled_layers: set[int] = field(default_factory=set)
     _original_forwards: dict[int, Callable[..., Any]] = field(default_factory=dict, init=False)
@@ -131,7 +132,14 @@ class QwenDynamicKVAdapter:
         slots = torch.arange(tokens, device=key.device)
         paged.write(key[0].transpose(0, 1), value[0].transpose(0, 1), slots)
         table = torch.arange(pages, device=key.device, dtype=torch.long).unsqueeze(0)
-        output, _ = paged_attention_dynamic_int8(
-            query[:, :, 0, :], paged, table, torch.tensor([tokens], device=key.device), self.config
-        )
+        query_token = query[:, :, 0, :]
+        lengths = torch.tensor([tokens], device=key.device)
+        if self.implementation == "dynamic":
+            output, _ = paged_attention_dynamic_int8(query_token, paged, table, lengths, self.config)
+        elif self.implementation == "dequant":
+            output, _ = attention_dequantized(query_token, paged, table, lengths, self.config)
+        elif self.implementation == "int8_gemm":
+            output, _ = attention_int8_simulated(query_token, paged, table, lengths, self.config)
+        else:
+            raise ValueError("implementation must be dynamic, dequant, or int8_gemm")
         return module.o_proj(output[:, None].reshape(batch, 1, heads * dim)), None

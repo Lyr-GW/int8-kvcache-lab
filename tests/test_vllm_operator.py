@@ -1,23 +1,26 @@
-"""Opt-in CUDA parity test for the real vLLM v0.6.6 PagedAttention operator."""
+"""CUDA parity test for vLLM's FlashAttention varlen paged kernel.
 
-import importlib.metadata
+The test runs only when a current vLLM build exposing
+``flash_attn_varlen_func`` is installed. vLLM 0.6.6 is not accepted.
+"""
 
 import pytest
 import torch
 
-from int8_kvcache_lab import PagedKVCache, QuantConfig, paged_attention_dynamic_int8, paged_attention_reference
+from int8_kvcache_lab import PagedKVCache, QuantConfig, attention_dequantized, paged_attention_reference
+from int8_kvcache_lab.pytorch_ref import relative_l2
 
 
-vllm = pytest.importorskip("vllm", reason="vLLM integration is installed only in the capture Colab runtime")
+vllm = pytest.importorskip("vllm", reason="vLLM is installed only in the capture Colab runtime")
 if not torch.cuda.is_available():
-    pytest.skip("vLLM PagedAttention integration requires CUDA", allow_module_level=True)
-if importlib.metadata.version("vllm") != "0.6.6":
-    pytest.skip("test is pinned to the vLLM 0.6.6 cache/operator contract", allow_module_level=True)
+    pytest.skip("FlashAttention oracle requires CUDA", allow_module_level=True)
+pytest.importorskip("vllm.v1.attention.backends.flash_attn", reason="requires vLLM V1 FlashAttention, tested at 0.29.0")
+pytest.importorskip("vllm.vllm_flash_attn", reason="requires the vLLM flash-attn package")
 
 from int8_kvcache_lab.vllm_operator import vllm_paged_attention_decode
 
 
-def test_vllm_paged_attention_matches_fp_reference_then_dynamic_int8():
+def test_flash_attn_varlen_matches_fp_reference_and_dequant_int8():
     torch.manual_seed(11)
     device = "cuda"
     block_size, kv_heads, query_heads, head_dim = 16, 2, 4, 64
@@ -35,8 +38,6 @@ def test_vllm_paged_attention_matches_fp_reference_then_dynamic_int8():
     query = torch.randn(2, query_heads, head_dim, dtype=torch.float16, device=device)
     native = vllm_paged_attention_decode(query, cache, table, lengths)
     fp_reference = paged_attention_reference(query, cache, table, lengths)
-    dynamic, _ = paged_attention_dynamic_int8(query, cache, table, lengths, QuantConfig(block_size=block_size))
-    native_error = (native - fp_reference).float().norm() / fp_reference.float().norm().clamp_min(1e-8)
-    int8_error = (dynamic - native).float().norm() / native.float().norm().clamp_min(1e-8)
-    assert native_error.item() <= 0.02
-    assert int8_error.item() <= 0.05
+    dequant, _ = attention_dequantized(query, cache, table, lengths, QuantConfig(block_size=block_size, kv_granularity="per_head"))
+    assert relative_l2(native, fp_reference) <= 0.02
+    assert relative_l2(dequant, native) <= 0.05
