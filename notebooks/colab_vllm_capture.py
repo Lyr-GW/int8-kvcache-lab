@@ -11,9 +11,8 @@
 
 # %%
 REPO_URL = "https://github.com/Lyr-GW/int8-kvcache-lab.git"
-# Use main after the vLLM 0.29 pull request is merged. Until then, set this
-# to that pull request's branch.
-BRANCH = "main"
+# This branch contains the vLLM 0.29 flow. Switch back to main after it merges.
+BRANCH = "cursor/latest-vllm-int8-flow-3602"
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 # %%
