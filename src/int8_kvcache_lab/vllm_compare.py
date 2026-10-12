@@ -8,8 +8,7 @@ stays on the native kernel.
 from __future__ import annotations
 
 import argparse
-
-import torch
+from contextlib import nullcontext
 
 from .vllm_runtime import configure_worker_multiprocessing, make_llm, replace_varlen_with_pytorch
 
@@ -31,19 +30,26 @@ def compare(
     granularity: str = "per_channel",
 ) -> dict[str, str]:
     """Return native, FP-reference, dequant, and INT8-GEMM generations."""
-    configure_worker_multiprocessing()
-    if not torch.cuda.is_available():
-        raise RuntimeError("the vLLM replacement comparison requires a CUDA GPU")
+    # The replacement executes inside EngineCore.  Build each single-use
+    # engine under an inherited wrapper, without initializing CUDA in the
+    # parent before the worker is forked.
+    configure_worker_multiprocessing("fork")
     if granularity not in ("per_head", "per_channel"):
         raise ValueError("granularity must be per_head or per_channel")
-    engine = make_llm(model, dtype=dtype, max_model_len=max_model_len)
-    texts = {"native_fp": _generate(engine, prompt, max_tokens)}
-    with replace_varlen_with_pytorch("fp"):
-        texts["pytorch_fp"] = _generate(engine, prompt, max_tokens)
-    with replace_varlen_with_pytorch("dequant", granularity=granularity):
-        texts["dequant"] = _generate(engine, prompt, max_tokens)
-    with replace_varlen_with_pytorch("int8_gemm", granularity=granularity):
-        texts["int8_gemm"] = _generate(engine, prompt, max_tokens)
+    def run(wrapper):
+        with wrapper:
+            engine = make_llm(
+                model,
+                dtype=dtype,
+                max_model_len=max_model_len,
+                worker_multiprocessing_method="fork",
+            )
+            return _generate(engine, prompt, max_tokens)
+
+    texts = {"native_fp": run(nullcontext())}
+    texts["pytorch_fp"] = run(replace_varlen_with_pytorch("fp"))
+    texts["dequant"] = run(replace_varlen_with_pytorch("dequant", granularity=granularity))
+    texts["int8_gemm"] = run(replace_varlen_with_pytorch("int8_gemm", granularity=granularity))
     for name, text in texts.items():
         print(f"{name}: {text!r}")
     print(f"pytorch_fp_matches_native={texts['pytorch_fp'] == texts['native_fp']}")

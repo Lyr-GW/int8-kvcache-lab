@@ -141,18 +141,23 @@ def capture_decode(
     dtype: str = "bfloat16",
 ) -> Path:
     """Run one eager generate and save the FlashAttention inputs and outputs."""
-    configure_worker_multiprocessing()
-    if not torch.cuda.is_available():
-        raise RuntimeError("vLLM capture requires an NVIDIA CUDA GPU")
+    # The recorder has to run in EngineCore, not the CLI parent.  Install it
+    # before creating the engine and use ``fork`` so the child inherits the
+    # wrapper.  Do not call ``torch.cuda.is_available()`` here: initializing
+    # CUDA in the parent would make a forked EngineCore fail at startup.
+    configure_worker_multiprocessing("fork")
     if max_tokens < 1:
         raise ValueError("max_tokens must be positive")
     from vllm import SamplingParams
 
     recorder = _ForwardRecorder()
-    # Build the engine before installing the observer so startup profiling
-    # does not get mixed into the captured generate steps.
-    engine = make_llm(model, dtype=dtype, max_model_len=max_model_len)
     with observe_flash_forward(recorder):
+        engine = make_llm(
+            model,
+            dtype=dtype,
+            max_model_len=max_model_len,
+            worker_multiprocessing_method="fork",
+        )
         engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
     snapshot = recorder.finish()
     snapshot.update({"model": model, "dtype": dtype, "prompt": prompt, "max_model_len": max_model_len})

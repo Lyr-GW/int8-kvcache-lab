@@ -78,21 +78,32 @@ def format_call_site(description: dict[str, Any]) -> str:
     )
 
 
-def configure_worker_multiprocessing() -> None:
-    """Use ``spawn`` before any CUDA probe can poison a forked worker.
+def configure_worker_multiprocessing(method: str = "spawn") -> None:
+    """Configure vLLM's worker process start method before importing vLLM.
 
     vLLM 0.29 defaults its library workers to ``fork`` on Linux.  Colab's
     CUDA probe initializes CUDA in the parent process, after which a forked
     EngineCore cannot initialize the device again.  These CLI modules have a
     ``__main__`` guard, so ``spawn`` is safe and avoids inheriting that CUDA
-    state.
+    state. ``fork`` is also supported for the capture path: its observer is
+    deliberately installed before vLLM creates EngineCore, allowing the
+    child to inherit it. That path must not initialize CUDA in the parent.
     """
-    os.environ[VLLM_WORKER_MULTIPROC_METHOD] = "spawn"
+    if method not in {"fork", "spawn"}:
+        raise ValueError("vLLM worker method must be 'fork' or 'spawn'")
+    os.environ[VLLM_WORKER_MULTIPROC_METHOD] = method
 
 
-def make_llm(model: str, *, dtype: str, max_model_len: int, gpu_memory_utilization: float = 0.75) -> Any:
+def make_llm(
+    model: str,
+    *,
+    dtype: str,
+    max_model_len: int,
+    gpu_memory_utilization: float = 0.75,
+    worker_multiprocessing_method: str = "spawn",
+) -> Any:
     """Construct an eager, single-GPU engine with prefix caching and chunked prefill off."""
-    configure_worker_multiprocessing()
+    configure_worker_multiprocessing(worker_multiprocessing_method)
     from vllm import LLM
 
     return LLM(

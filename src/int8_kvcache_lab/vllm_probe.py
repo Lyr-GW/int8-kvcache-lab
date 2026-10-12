@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 
-import torch
-
 from .vllm_runtime import configure_worker_multiprocessing, describe_call, format_call_site, make_llm, observe_flash_forward
 
 
@@ -18,9 +16,9 @@ def probe(
     dtype: str = "bfloat16",
 ) -> dict[str, object]:
     """Generate one prompt and return the first FlashAttention call description."""
-    configure_worker_multiprocessing()
-    if not torch.cuda.is_available():
-        raise RuntimeError("the vLLM probe requires an NVIDIA CUDA GPU")
+    # The callback runs in vLLM's EngineCore.  It must be inherited by that
+    # process, and the parent must stay CUDA-uninitialized before ``fork``.
+    configure_worker_multiprocessing("fork")
     from vllm import SamplingParams
 
     seen: dict[str, object] = {}
@@ -52,8 +50,13 @@ def probe(
             f"output={description['output_shape']}"
         )
 
-    engine = make_llm(model, dtype=dtype, max_model_len=max_model_len)
     with observe_flash_forward(callback):
+        engine = make_llm(
+            model,
+            dtype=dtype,
+            max_model_len=max_model_len,
+            worker_multiprocessing_method="fork",
+        )
         result = engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
     if not seen:
         raise RuntimeError("generate finished without entering FlashAttentionImpl.forward")
