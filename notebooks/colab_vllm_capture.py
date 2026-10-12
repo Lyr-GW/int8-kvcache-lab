@@ -11,12 +11,11 @@
 
 # %%
 REPO_URL = "https://github.com/Lyr-GW/int8-kvcache-lab.git"
-# This branch contains the vLLM 0.29 flow. Switch back to main after it merges.
-BRANCH = "cursor/latest-vllm-int8-flow-3602"
+BRANCH = "main"
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 # %%
-!git clone --branch {BRANCH} {REPO_URL} /content/project
+!if [ -d /content/project/.git ]; then git -C /content/project fetch origin {BRANCH} && git -C /content/project checkout --detach origin/{BRANCH}; else git clone --branch {BRANCH} {REPO_URL} /content/project; fi
 %cd /content/project
 !bash scripts/install_vllm_capture.sh
 

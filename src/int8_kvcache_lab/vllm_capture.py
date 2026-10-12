@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from .vllm_runtime import (
+    configure_worker_multiprocessing,
     describe_call,
     format_call_site,
     make_llm,
@@ -140,6 +141,7 @@ def capture_decode(
     dtype: str = "bfloat16",
 ) -> Path:
     """Run one eager generate and save the FlashAttention inputs and outputs."""
+    configure_worker_multiprocessing()
     if not torch.cuda.is_available():
         raise RuntimeError("vLLM capture requires an NVIDIA CUDA GPU")
     if max_tokens < 1:

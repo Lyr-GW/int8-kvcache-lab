@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from typing import Any
 
 TESTED_VLLM_VERSION = "0.29.0"
+VLLM_WORKER_MULTIPROC_METHOD = "VLLM_WORKER_MULTIPROC_METHOD"
 
 _OPERATOR_BY_FA_VERSION = {
     2: "torch.ops._vllm_fa2_C.varlen_fwd",
@@ -77,8 +78,21 @@ def format_call_site(description: dict[str, Any]) -> str:
     )
 
 
+def configure_worker_multiprocessing() -> None:
+    """Use ``spawn`` before any CUDA probe can poison a forked worker.
+
+    vLLM 0.29 defaults its library workers to ``fork`` on Linux.  Colab's
+    CUDA probe initializes CUDA in the parent process, after which a forked
+    EngineCore cannot initialize the device again.  These CLI modules have a
+    ``__main__`` guard, so ``spawn`` is safe and avoids inheriting that CUDA
+    state.
+    """
+    os.environ[VLLM_WORKER_MULTIPROC_METHOD] = "spawn"
+
+
 def make_llm(model: str, *, dtype: str, max_model_len: int, gpu_memory_utilization: float = 0.75) -> Any:
     """Construct an eager, single-GPU engine with prefix caching and chunked prefill off."""
+    configure_worker_multiprocessing()
     from vllm import LLM
 
     return LLM(

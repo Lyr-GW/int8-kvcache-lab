@@ -11,7 +11,7 @@ import argparse
 
 import torch
 
-from .vllm_runtime import make_llm, replace_varlen_with_pytorch
+from .vllm_runtime import configure_worker_multiprocessing, make_llm, replace_varlen_with_pytorch
 
 
 def _generate(engine, prompt: str, max_tokens: int) -> str:
@@ -31,6 +31,7 @@ def compare(
     granularity: str = "per_channel",
 ) -> dict[str, str]:
     """Return native, FP-reference, dequant, and INT8-GEMM generations."""
+    configure_worker_multiprocessing()
     if not torch.cuda.is_available():
         raise RuntimeError("the vLLM replacement comparison requires a CUDA GPU")
     if granularity not in ("per_head", "per_channel"):

@@ -6,7 +6,7 @@ import argparse
 
 import torch
 
-from .vllm_runtime import describe_call, format_call_site, make_llm, observe_flash_forward
+from .vllm_runtime import configure_worker_multiprocessing, describe_call, format_call_site, make_llm, observe_flash_forward
 
 
 def probe(
@@ -18,6 +18,7 @@ def probe(
     dtype: str = "bfloat16",
 ) -> dict[str, object]:
     """Generate one prompt and return the first FlashAttention call description."""
+    configure_worker_multiprocessing()
     if not torch.cuda.is_available():
         raise RuntimeError("the vLLM probe requires an NVIDIA CUDA GPU")
     from vllm import SamplingParams
