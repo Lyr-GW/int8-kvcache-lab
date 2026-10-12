@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
+from pathlib import Path
+
+import torch
 
 from .vllm_runtime import configure_worker_multiprocessing, describe_call, format_call_site, make_llm, observe_flash_forward
 
@@ -22,6 +27,9 @@ def probe(
     from vllm import SamplingParams
 
     seen: dict[str, object] = {}
+    descriptor_fd, descriptor_name = tempfile.mkstemp(prefix="int8-kvcache-probe-", suffix=".pt")
+    os.close(descriptor_fd)
+    descriptor_file = Path(descriptor_name)
 
     def callback(impl, query, key, value, kv_cache, metadata, output) -> None:
         if seen:
@@ -41,6 +49,7 @@ def probe(
             }
         )
         seen.update(description)
+        torch.save(seen, descriptor_file)
         print(format_call_site(description))
         print(
             "shapes "
@@ -50,14 +59,19 @@ def probe(
             f"output={description['output_shape']}"
         )
 
-    with observe_flash_forward(callback):
-        engine = make_llm(
-            model,
-            dtype=dtype,
-            max_model_len=max_model_len,
-            worker_multiprocessing_method="fork",
-        )
-        result = engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
+    try:
+        with observe_flash_forward(callback):
+            engine = make_llm(
+                model,
+                dtype=dtype,
+                max_model_len=max_model_len,
+                worker_multiprocessing_method="fork",
+            )
+            result = engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
+        if not seen and descriptor_file.stat().st_size:
+            seen.update(torch.load(descriptor_file, map_location="cpu", weights_only=False))
+    finally:
+        descriptor_file.unlink(missing_ok=True)
     if not seen:
         raise RuntimeError("generate finished without entering FlashAttentionImpl.forward")
     text = result[0].outputs[0].text if result and result[0].outputs else ""

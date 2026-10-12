@@ -69,7 +69,7 @@ def test_probe_uses_fork_without_parent_cuda_probe(monkeypatch):
     assert calls == ["observer", "engine"]
 
 
-def test_capture_uses_fork_without_parent_cuda_probe(monkeypatch):
+def test_capture_uses_fork_without_parent_cuda_probe(monkeypatch, tmp_path):
     """The capture wrapper must be present when EngineCore forks."""
     calls: list[str] = []
 
@@ -104,6 +104,25 @@ def test_capture_uses_fork_without_parent_cuda_probe(monkeypatch):
     )
 
     with pytest.raises(StopAfterEngineStart):
-        vllm_capture.capture_decode(model="unused", prompt="unused", output=None)
+        vllm_capture.capture_decode(
+            model="unused", prompt="unused", output=tmp_path / "capture.pt"
+        )
 
     assert calls == ["observer", "engine"]
+
+
+def test_recorder_restores_worker_spill(tmp_path):
+    """Parent-side finish can recover tensors recorded in a forked worker."""
+    spill = tmp_path / "worker.pt"
+    worker = vllm_capture._ForwardRecorder(spill)
+    worker.call_site = {"operator": "test"}
+    worker.steps = [{"layers": []}]
+    worker._open_key = ((1,), (0, 1))
+    worker._open_layers = []
+    worker._persist()
+
+    parent = vllm_capture._ForwardRecorder(spill)
+    parent._restore_from_worker()
+
+    assert parent.call_site == {"operator": "test"}
+    assert parent.steps == [{"layers": []}]

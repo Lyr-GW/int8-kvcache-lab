@@ -56,11 +56,12 @@ def _logical_layer(key_cache: torch.Tensor, value_cache: torch.Tensor, block_tab
 class _ForwardRecorder:
     """Group per-layer forward taps into decoder steps."""
 
-    def __init__(self) -> None:
+    def __init__(self, spill_path: Path | None = None) -> None:
         self.call_site: dict[str, Any] | None = None
         self.steps: list[dict[str, Any]] = []
         self._open_key: tuple[Any, ...] | None = None
         self._open_layers: list[dict[str, Any]] = []
+        self.spill_path = spill_path
 
     def __call__(self, impl: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, kv_cache: torch.Tensor, metadata: Any, output: torch.Tensor) -> None:
         block_table = _metadata_tensor(metadata, "block_table", "block_table_tensor")
@@ -104,6 +105,32 @@ class _ForwardRecorder:
             self._flush()
             self._open_key = step_key
         self._open_layers.append(layer)
+        self._persist()
+
+    def _persist(self) -> None:
+        """Make the latest child-process recorder state visible to its parent."""
+        if self.spill_path is None:
+            return
+        temporary = self.spill_path.with_suffix(self.spill_path.suffix + ".tmp")
+        torch.save(
+            {
+                "call_site": self.call_site,
+                "steps": self.steps,
+                "open_key": self._open_key,
+                "open_layers": self._open_layers,
+            },
+            temporary,
+        )
+        temporary.replace(self.spill_path)
+
+    def _restore_from_worker(self) -> None:
+        if self.call_site is not None or self.spill_path is None or not self.spill_path.exists():
+            return
+        state = torch.load(self.spill_path, map_location="cpu", weights_only=False)
+        self.call_site = state["call_site"]
+        self.steps = state["steps"]
+        self._open_key = state["open_key"]
+        self._open_layers = state["open_layers"]
 
     def _flush(self) -> None:
         if self._open_layers:
@@ -111,6 +138,7 @@ class _ForwardRecorder:
             self._open_layers = []
 
     def finish(self) -> dict[str, Any]:
+        self._restore_from_worker()
         self._flush()
         if not self.steps or self.call_site is None:
             raise RuntimeError("vLLM finished without a FlashAttention forward that carried a block table")
@@ -150,7 +178,9 @@ def capture_decode(
         raise ValueError("max_tokens must be positive")
     from vllm import SamplingParams
 
-    recorder = _ForwardRecorder()
+    spill_path = output.with_suffix(output.suffix + ".worker.pt")
+    spill_path.unlink(missing_ok=True)
+    recorder = _ForwardRecorder(spill_path)
     with observe_flash_forward(recorder):
         engine = make_llm(
             model,
@@ -160,6 +190,7 @@ def capture_decode(
         )
         engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
     snapshot = recorder.finish()
+    spill_path.unlink(missing_ok=True)
     snapshot.update({"model": model, "dtype": dtype, "prompt": prompt, "max_model_len": max_model_len})
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(snapshot, output)
