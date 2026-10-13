@@ -1,4 +1,6 @@
-"""Stage-5 score table: native FP versus per-channel dequant and INT8 GEMM.
+"""Legacy Transformers-only smoke scorecard.
+
+Use ``vllm_scorecard`` for the Stage-5 vLLM attention-backend comparison.
 
 The default task list is a four-item smoke set, one item each for AIME-style
 integer answers, a tiny code function, GPQA-style letters, and MMLU-style

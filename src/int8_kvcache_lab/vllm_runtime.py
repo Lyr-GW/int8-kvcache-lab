@@ -191,12 +191,15 @@ def replace_varlen_with_pytorch(
     *,
     granularity: str = "per_channel",
     statistic: str = "absmax",
+    query_granularity: str | None = None,
+    call_stats: dict[str, int] | None = None,
 ) -> Iterator[None]:
-    """Replace the FlashAttention varlen call with the stage-3/4 PyTorch path.
+    """Replace supported FlashAttention varlen calls with PyTorch references.
 
     Metadata setup and the KV write stay in vLLM. Only the attention math
     changes. Calls without a block table, or with a non-boolean causal flag,
-    keep the native kernel.
+    keep the native kernel. Stage 5 sets ``query_granularity`` to per-head or
+    per-channel to apply dynamic Q scales along with the selected KV layout.
     """
     import vllm.v1.attention.backends.flash_attn as flash_module
 
@@ -206,13 +209,26 @@ def replace_varlen_with_pytorch(
         raise ValueError("implementation must be fp, dequant, or int8_gemm")
     original = flash_module.flash_attn_varlen_func
 
+    def increment_call_stat(name: str) -> None:
+        if call_stats is None:
+            return
+        counter = call_stats.get(name)
+        if hasattr(counter, "get_lock") and hasattr(counter, "value"):
+            with counter.get_lock():
+                counter.value += 1
+        else:
+            call_stats[name] = int(counter or 0) + 1
+
     def wrapped(**kwargs):
         causal = kwargs.get("causal")
         block_table = kwargs.get("block_table")
         window = kwargs.get("window_size")
         uses_window = window not in (None, (-1, -1))
         if block_table is None or not isinstance(causal, bool) or uses_window:
+            increment_call_stat("native_fallback_calls")
             return original(**kwargs)
+        key = "pytorch_fp_calls" if implementation == "fp" else "quantized_pytorch_calls"
+        increment_call_stat(key)
         common = dict(
             query=kwargs["q"],
             key_cache=kwargs["k"],
@@ -231,6 +247,7 @@ def replace_varlen_with_pytorch(
                 implementation=implementation,
                 granularity=granularity,
                 statistic=statistic,
+                query_granularity=query_granularity,
             )
         destination = kwargs.get("out")
         if destination is not None:

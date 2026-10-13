@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from .reporting import write_report
 from .vllm_runtime import configure_worker_multiprocessing, describe_call, format_call_site, make_llm, observe_flash_forward
 
 
@@ -77,6 +78,18 @@ def probe(
     text = result[0].outputs[0].text if result and result[0].outputs else ""
     seen["generated_text"] = text
     print(f"generated: {text!r}")
+    report_path = write_report({
+        "experiment": "stage1_vllm_probe",
+        "model": model,
+        "dtype": dtype,
+        "prompt": prompt,
+        "max_model_len": max_model_len,
+        "max_tokens": max_tokens,
+        "sampling": {"temperature": 0.0, "seed": 7},
+        "attention_backend": "FLASH_ATTN",
+        **seen,
+    })
+    print(f"wrote {report_path}")
     return seen
 
 

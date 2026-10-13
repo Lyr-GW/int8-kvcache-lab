@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from pathlib import Path
 
 from .vllm_runtime import configure_worker_multiprocessing, make_llm, replace_varlen_with_pytorch
+from .reporting import default_output_dir, write_report
 
 
 def _generate(engine, prompt: str, max_tokens: int) -> str:
@@ -28,6 +30,7 @@ def compare(
     max_model_len: int = 256,
     dtype: str = "bfloat16",
     granularity: str = "per_channel",
+    output_dir: str | Path | None = None,
 ) -> dict[str, str]:
     """Return native, FP-reference, dequant, and INT8-GEMM generations."""
     # The replacement executes inside EngineCore.  Build each single-use
@@ -53,6 +56,18 @@ def compare(
     for name, text in texts.items():
         print(f"{name}: {text!r}")
     print(f"pytorch_fp_matches_native={texts['pytorch_fp'] == texts['native_fp']}")
+    report_path = write_report({
+        "experiment": "stage3_live_vllm_compare",
+        "model": model,
+        "dtype": dtype,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "max_model_len": max_model_len,
+        "kv_granularity": granularity,
+        "outputs": texts,
+        "pytorch_fp_matches_native": texts["pytorch_fp"] == texts["native_fp"],
+    }, output_dir or default_output_dir())
+    print(f"wrote {report_path}")
     return texts
 
 
@@ -64,6 +79,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=256)
     parser.add_argument("--dtype", choices=("half", "bfloat16"), default="bfloat16")
     parser.add_argument("--granularity", choices=("per_head", "per_channel"), default="per_channel")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     compare(
         model=args.model,
@@ -72,6 +88,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         dtype=args.dtype,
         granularity=args.granularity,
+        output_dir=args.output_dir,
     )
 
 

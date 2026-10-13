@@ -25,6 +25,7 @@ from .vllm_runtime import (
     pack_referenced_pages,
     split_packed_kv_cache,
 )
+from .reporting import default_output_dir, register_artifact
 
 
 def _metadata_tensor(metadata: Any, *names: str) -> torch.Tensor | None:
@@ -188,12 +189,29 @@ def capture_decode(
             max_model_len=max_model_len,
             worker_multiprocessing_method="fork",
         )
-        engine.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7))
+        generations = engine.generate(
+            [prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=7)
+        )
+        generated_text = generations[0].outputs[0].text if generations and generations[0].outputs else ""
     snapshot = recorder.finish()
     spill_path.unlink(missing_ok=True)
-    snapshot.update({"model": model, "dtype": dtype, "prompt": prompt, "max_model_len": max_model_len})
+    snapshot.update({
+        "model": model,
+        "dtype": dtype,
+        "prompt": prompt,
+        "max_model_len": max_model_len,
+        "max_tokens": max_tokens,
+        "sampling": {"temperature": 0.0, "seed": 7},
+        "generated_text": generated_text,
+    })
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(snapshot, output)
+    register_artifact(output, kind="raw_capture", details={
+        "format": snapshot["format"],
+        "model": model,
+        "sequence_length": snapshot["sequence_length"],
+        "layer_count": len(snapshot["layers"]),
+    })
     return output
 
 
@@ -203,18 +221,19 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--prompt", default="What is 17 * 23? Reply with the integer only.")
     parser.add_argument("--dataset", choices=("prompt", "aime"), default="prompt")
-    parser.add_argument("--output", type=Path, default=Path("artifacts/vllm-qwen-kv-cache.pt"))
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=256)
     parser.add_argument("--dtype", choices=("half", "bfloat16"), default="bfloat16")
     args = parser.parse_args()
+    output = args.output or (default_output_dir() / "vllm-qwen-kv-cache.pt")
     prompt = args.prompt
     if args.dataset == "aime":
         prompt = _aime_prompt(prompt)
     path = capture_decode(
         model=args.model,
         prompt=prompt,
-        output=args.output,
+        output=output,
         max_tokens=args.max_tokens,
         max_model_len=args.max_model_len,
         dtype=args.dtype,

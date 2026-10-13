@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from .pytorch_ref import ref_paged_attn, relative_l2
-from .reporting import write_report
+from .reporting import default_output_dir, write_report
 
 
 def _output_as_heads(output: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
@@ -58,11 +58,12 @@ def replay(capture: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     capture = torch.load(args.capture, map_location="cpu", weights_only=False)
     report = replay(capture)
-    path = write_report({"experiment": "stage3_replay", **report}, args.output_dir)
+    report["capture_path"] = str(args.capture)
+    path = write_report({"experiment": "stage3_replay", **report}, args.output_dir or default_output_dir())
     print(json.dumps(report, indent=2))
     print(f"wrote {path}")
     raise SystemExit(0 if report["passes_stage3_gate"] else 2)

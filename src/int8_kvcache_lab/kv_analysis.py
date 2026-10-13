@@ -18,7 +18,7 @@ from typing import Any, Iterable
 import torch
 
 from .quantization import INT8_MAX
-from .reporting import to_jsonable, write_report
+from .reporting import default_output_dir, to_jsonable, write_report
 
 
 _CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel")
@@ -256,7 +256,7 @@ def main() -> None:
     """Analyze a ``vllm_capture`` artifact and write a JSON report."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True, help=".pt artifact written by vllm_capture")
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--relative-l2-target", type=float, default=0.01)
     args = parser.parse_args()
     capture = torch.load(args.capture, map_location="cpu", weights_only=False)
@@ -272,7 +272,7 @@ def main() -> None:
             f"{name}={report['candidates'][name]['relative_l2']:.5f}" for name in _CANDIDATES
         )
     )
-    path = write_report({"experiment": "vllm_kv_cache_calibration", **report}, args.output_dir)
+    path = write_report({"experiment": "vllm_kv_cache_calibration", **report}, args.output_dir or default_output_dir())
     print(f"wrote {path}")
 
 

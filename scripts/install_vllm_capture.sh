@@ -26,6 +26,9 @@ PY
 
 python -m pip install --upgrade pip
 python -m pip install --upgrade "vllm==${VLLM_VERSION}"
+# The source install below intentionally skips all dependencies to protect the
+# vLLM-pinned Torch build. Install the Stage-5 dataset client explicitly.
+python -m pip install "datasets==3.2.0"
 python -m pip install -e "${PROJECT_DIR}[dev]" --no-deps
 
 if [[ ! -d "${VLLM_DIR}/.git" ]]; then
