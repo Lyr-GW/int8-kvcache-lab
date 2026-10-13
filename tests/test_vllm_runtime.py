@@ -112,17 +112,37 @@ def test_capture_uses_fork_without_parent_cuda_probe(monkeypatch, tmp_path):
 
 
 def test_recorder_restores_worker_spill(tmp_path):
-    """Parent-side finish can recover tensors recorded in a forked worker."""
+    """Parent-side restore reads incremental worker shards without snapshots."""
     spill = tmp_path / "worker.pt"
     worker = vllm_capture._ForwardRecorder(spill)
     worker.call_site = {"operator": "test"}
-    worker.steps = [{"layers": []}]
     worker._open_key = ((1,), (0, 1))
-    worker._open_layers = []
+    worker._open_layers = [{"query": "layer-0"}]
     worker._persist()
 
     parent = vllm_capture._ForwardRecorder(spill)
     parent._restore_from_worker()
 
     assert parent.call_site == {"operator": "test"}
-    assert parent.steps == [{"layers": []}]
+    assert parent.steps == [{"layers": [{"query": "layer-0"}]}]
+    assert sorted(path.name for path in worker.spill_dir.glob("*.pt")) == ["000000.pt"]
+
+
+def test_recorder_spills_only_new_layer_per_callback(tmp_path):
+    """Repeated worker callbacks append compact shards, not cumulative dumps."""
+    spill = tmp_path / "worker.pt"
+    worker = vllm_capture._ForwardRecorder(spill)
+    worker.call_site = {"operator": "test"}
+    worker._open_key = ((1,), (0, 1))
+    worker._open_layers = [{"query": "layer-0"}]
+    worker._persist()
+    worker._open_layers.append({"query": "layer-1"})
+    worker._persist()
+
+    assert sorted(path.name for path in worker.spill_dir.glob("*.pt")) == [
+        "000000.pt",
+        "000001.pt",
+    ]
+    parent = vllm_capture._ForwardRecorder(spill)
+    parent._restore_from_worker()
+    assert parent.steps == [{"layers": [{"query": "layer-0"}, {"query": "layer-1"}]}]

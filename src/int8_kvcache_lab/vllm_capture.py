@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,8 @@ class _ForwardRecorder:
         self._open_key: tuple[Any, ...] | None = None
         self._open_layers: list[dict[str, Any]] = []
         self.spill_path = spill_path
+        self.spill_dir = None if spill_path is None else spill_path.with_name(f"{spill_path.name}.parts")
+        self._spill_index = 0
 
     def __call__(self, impl: Any, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, kv_cache: torch.Tensor, metadata: Any, output: torch.Tensor) -> None:
         block_table = _metadata_tensor(metadata, "block_table", "block_table_tensor")
@@ -109,29 +112,40 @@ class _ForwardRecorder:
         self._persist()
 
     def _persist(self) -> None:
-        """Make the latest child-process recorder state visible to its parent."""
-        if self.spill_path is None:
+        """Spill only the newest layer so checkpoint I/O is linear in capture size."""
+        if self.spill_dir is None or not self._open_layers:
             return
-        temporary = self.spill_path.with_suffix(self.spill_path.suffix + ".tmp")
+        self.spill_dir.mkdir(parents=True, exist_ok=True)
+        part = self.spill_dir / f"{self._spill_index:06d}.pt"
+        temporary = part.with_suffix(".pt.tmp")
         torch.save(
             {
                 "call_site": self.call_site,
-                "steps": self.steps,
-                "open_key": self._open_key,
-                "open_layers": self._open_layers,
+                "step_key": self._open_key,
+                "layer": self._open_layers[-1],
             },
             temporary,
         )
-        temporary.replace(self.spill_path)
+        temporary.replace(part)
+        self._spill_index += 1
 
     def _restore_from_worker(self) -> None:
-        if self.call_site is not None or self.spill_path is None or not self.spill_path.exists():
+        if self.call_site is not None or self.spill_dir is None or not self.spill_dir.exists():
             return
-        state = torch.load(self.spill_path, map_location="cpu", weights_only=False)
-        self.call_site = state["call_site"]
-        self.steps = state["steps"]
-        self._open_key = state["open_key"]
-        self._open_layers = state["open_layers"]
+        current_key: tuple[Any, ...] | None = None
+        current_layers: list[dict[str, Any]] = []
+        for part in sorted(self.spill_dir.glob("*.pt")):
+            state = torch.load(part, map_location="cpu", weights_only=False)
+            if self.call_site is None:
+                self.call_site = state["call_site"]
+            step_key = state["step_key"]
+            if current_layers and step_key != current_key:
+                self.steps.append({"layers": current_layers})
+                current_layers = []
+            current_key = step_key
+            current_layers.append(state["layer"])
+        if current_layers:
+            self.steps.append({"layers": current_layers})
 
     def _flush(self) -> None:
         if self._open_layers:
@@ -181,6 +195,9 @@ def capture_decode(
 
     spill_path = output.with_suffix(output.suffix + ".worker.pt")
     spill_path.unlink(missing_ok=True)
+    spill_dir = spill_path.with_name(f"{spill_path.name}.parts")
+    if spill_dir.exists():
+        shutil.rmtree(spill_dir)
     recorder = _ForwardRecorder(spill_path)
     with observe_flash_forward(recorder):
         engine = make_llm(
@@ -195,6 +212,8 @@ def capture_decode(
         generated_text = generations[0].outputs[0].text if generations and generations[0].outputs else ""
     snapshot = recorder.finish()
     spill_path.unlink(missing_ok=True)
+    if recorder.spill_dir is not None:
+        shutil.rmtree(recorder.spill_dir, ignore_errors=True)
     snapshot.update({
         "model": model,
         "dtype": dtype,
