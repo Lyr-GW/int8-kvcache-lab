@@ -122,3 +122,25 @@ def logical_kv_scale(
     if granularity == "per_channel":
         return _positive_scale(_magnitude(values, statistic), eps)
     raise ValueError("granularity must be per_head or per_channel")
+
+
+def logical_query_scale(
+    values: torch.Tensor,
+    *,
+    granularity: str,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return a dynamic Q scale for logical ``[tokens, query_heads, dim]``.
+
+    Q is reduced over its token axis. Per-head yields one scale per query head;
+    per-channel yields one scale per (query head, head-dimension) channel.
+    """
+    if values.ndim != 3:
+        raise ValueError("logical query must have shape [tokens, query_heads, head_dim]")
+    if granularity == "per_head":
+        statistic = values.float().abs().amax(dim=(0, 2))
+    elif granularity == "per_channel":
+        statistic = values.float().abs().amax(dim=0)
+    else:
+        raise ValueError("granularity must be per_head or per_channel")
+    return _positive_scale(statistic, eps)
