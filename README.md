@@ -24,6 +24,16 @@ That scale sits on the axis QK reduces, so the INT8 GEMM path folds it into Q.
 product. Stage 2 chooses between them from the captured magnitudes. It does
 not silently change the older per-head dynamic PPL path.
 
+The tutorial's scale for each token's `(kv_head, head_dim)` vector is named
+`per_token_head` here: its scale has shape `[tokens, kv_heads]` after logical
+page gathering. Its K scale multiplies each token's QK logit after the
+head-dimension reduction. Its V scale must multiply each token's contribution
+before the PV token reduction. This differs from `per_channel`, whose scale
+has shape `[kv_heads, head_dim]`. Stage 2 reports `per_token_head` as an
+additional candidate; its automatic recommendation remains per-head or
+per-channel. Use `--granularity per_token_head` to select it explicitly for
+the vLLM scorecard.
+
 ## Colab: stages 1–5 on vLLM 0.29.0
 
 Use a fresh GPU runtime and `notebooks/colab_vllm_capture.ipynb`. The default

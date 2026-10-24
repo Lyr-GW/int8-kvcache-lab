@@ -121,7 +121,16 @@ def logical_kv_scale(
         return _positive_scale(_magnitude(values, statistic).amax(dim=-1), eps)
     if granularity == "per_channel":
         return _positive_scale(_magnitude(values, statistic), eps)
-    raise ValueError("granularity must be per_head or per_channel")
+    if granularity == "per_token_head":
+        absolute = values.float().abs()
+        if statistic == "absmax":
+            magnitude = absolute.amax(dim=-1)
+        elif statistic == "p999":
+            magnitude = torch.quantile(absolute, 0.999, dim=-1)
+        else:
+            raise ValueError("statistic must be absmax or p999")
+        return _positive_scale(magnitude, eps)
+    raise ValueError("granularity must be per_head, per_channel, or per_token_head")
 
 
 def logical_query_scale(

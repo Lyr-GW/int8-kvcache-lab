@@ -34,7 +34,7 @@ def _case(seed: int, scale_first_channel: float = 1.0):
 def test_dequant_and_int8_gemm_stay_near_the_fp_reference():
     query, cache, table, lengths = _case(4)
     reference = paged_attention_reference(query, cache, table, lengths)
-    for granularity in ("per_head", "per_channel"):
+    for granularity in ("per_head", "per_channel", "per_token_head"):
         config = QuantConfig(block_size=16, kv_granularity=granularity)
         dequant, _ = attention_dequantized(query, cache, table, lengths, config)
         simulated, _ = attention_int8_simulated(query, cache, table, lengths, config)
@@ -50,6 +50,17 @@ def test_per_channel_int8_gemm_survives_a_large_channel_imbalance():
     simulated, _ = attention_int8_simulated(query, cache, table, lengths, config)
     assert relative_l2(dequant, reference) <= 0.05
     assert relative_l2(simulated, dequant) <= 0.10
+
+
+def test_per_token_head_scales_k_after_qk_and_v_before_pv():
+    query = torch.tensor([[[1.0, 1.0]]])
+    key = torch.tensor([[[1.0, 0.0]], [[0.0, 2.0]]])
+    value = torch.tensor([[[4.0, 0.0]], [[0.0, 8.0]]])
+    expected = dequantized_attention(query, key, value, granularity="per_token_head")
+    actual = int8_simulated_attention(
+        query, key, value, granularity="per_token_head", independent_query_scale=True
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("query_granularity", ["per_head", "per_channel"])

@@ -117,16 +117,29 @@ def _quantize_logical_kv(
     statistic: str,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Dynamic scales use valid logical KV tokens. per_token_head keeps the
+    # token axis; per_channel keeps the head_dim axis. K and V remain separate.
     key_scale = logical_kv_scale(key, granularity=granularity, statistic=statistic, eps=eps)
     value_scale = logical_kv_scale(value, granularity=granularity, statistic=statistic, eps=eps)
-    key_view = key_scale.view(1, -1, 1) if granularity == "per_head" else key_scale.view(1, *key_scale.shape)
-    value_view = value_scale.view(1, -1, 1) if granularity == "per_head" else value_scale.view(1, *value_scale.shape)
+    key_view = _kv_scale_view(key_scale, granularity)
+    value_view = _kv_scale_view(value_scale, granularity)
     return (
         quantize_symmetric_int8(key, key_view),
         quantize_symmetric_int8(value, value_view),
         key_scale,
         value_scale,
     )
+
+
+def _kv_scale_view(scale: torch.Tensor, granularity: str) -> torch.Tensor:
+    """Broadcast a KV scale onto logical ``[tokens, kv_heads, head_dim]``."""
+    if granularity == "per_head":
+        return scale.view(1, -1, 1)
+    if granularity == "per_channel":
+        return scale.unsqueeze(0)
+    if granularity == "per_token_head":
+        return scale.unsqueeze(-1)
+    raise ValueError(f"unsupported KV granularity: {granularity}")
 
 
 def dequantized_attention(
@@ -153,8 +166,8 @@ def dequantized_attention(
         query_scale = logical_query_scale(query, granularity=query_granularity, eps=eps)
         query_view = query_scale.view(1, -1, 1) if query_granularity == "per_head" else query_scale.unsqueeze(0)
         query = (quantize_symmetric_int8(query, query_view).float() * query_view).to(query.dtype)
-    key_view = key_scale.view(1, -1, 1) if granularity == "per_head" else key_scale.view(1, *key_scale.shape)
-    value_view = value_scale.view(1, -1, 1) if granularity == "per_head" else value_scale.view(1, *value_scale.shape)
+    key_view = _kv_scale_view(key_scale, granularity)
+    value_view = _kv_scale_view(value_scale, granularity)
     key_deq = (key_i8.float() * key_view).to(query.dtype)
     value_deq = (value_i8.float() * value_view).to(query.dtype)
     scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
@@ -179,12 +192,12 @@ def int8_simulated_attention(
 
     By default, per-channel K scales are folded into Q before Q quantization.
     Stage 5 may use independent per-head or per-channel Q scales. Per-channel
-    K/Q scales weight each channel product before reduction; per-head scales
-    stay outside the dot product.
-    V scales are applied after PV's token reduction. Softmax stays in FP32.
+    K/Q scales weight each channel product before reduction. Per-token-head K
+    scales multiply each token's logit after QK; its V scales multiply each
+    token before PV. Softmax stays in FP32.
     """
-    if granularity not in ("per_head", "per_channel"):
-        raise ValueError("granularity must be per_head or per_channel")
+    if granularity not in ("per_head", "per_channel", "per_token_head"):
+        raise ValueError("granularity must be per_head, per_channel, or per_token_head")
     scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
     key_i8, value_i8, key_scale, value_scale = _quantize_logical_kv(
         key, value, granularity=granularity, statistic=statistic, eps=eps
@@ -205,13 +218,32 @@ def int8_simulated_attention(
         query_scale = per_tensor_scale(folded_query.unsqueeze(0), eps)[0]
         query_i8 = quantize_symmetric_int8(folded_query, query_scale)
         key_factor = query_scale
+    elif granularity == "per_token_head":
+        query_scale = per_tensor_scale(query.unsqueeze(0), eps)[0]
+        query_i8 = quantize_symmetric_int8(query, query_scale)
+        key_factor = None
     else:
         query_scale = per_tensor_scale(query.unsqueeze(0), eps)[0]
         query_i8 = quantize_symmetric_int8(query, query_scale)
         # [query_heads, 1, 1] broadcasts across the QK logits [heads, query, tokens].
         key_factor = (query_scale * key_scale.repeat_interleave(groups, dim=0)).view(-1, 1, 1)
     expanded_key = key_i8.float().repeat_interleave(groups, dim=1)
-    if query_granularity == "per_channel" and granularity == "per_channel":
+    if granularity == "per_token_head":
+        # K scale is constant across head_dim but changes with token, so it
+        # multiplies each QK logit after the channel reduction.
+        if query_granularity == "per_channel":
+            logits = torch.einsum(
+                "qhd,khd,hd->hqk", query_i8.float(), expanded_key, query_scale
+            )
+        else:
+            logits = torch.einsum("qhd,khd->hqk", query_i8.float(), expanded_key)
+            if query_granularity == "per_head":
+                logits = logits * query_scale.view(-1, 1, 1)
+            else:
+                logits = logits * query_scale
+        key_factor = key_scale.repeat_interleave(groups, dim=1).transpose(0, 1)
+        logits = logits * key_factor[:, None, :] * scale
+    elif query_granularity == "per_channel" and granularity == "per_channel":
         expanded_key_scale = key_scale.repeat_interleave(groups, dim=0)
         expanded_query_scale = query_scale.repeat_interleave(1, dim=0)
         logits = torch.einsum(
@@ -255,6 +287,13 @@ def int8_simulated_attention(
         probability_scale = per_tensor_scale(probabilities.unsqueeze(0), eps)[0]
         probabilities = quantize_symmetric_int8(probabilities, probability_scale).float() * probability_scale
     expanded_value = value_i8.float().repeat_interleave(groups, dim=1)
+    if granularity == "per_token_head":
+        # V scale changes along the token reduction axis of PV, so apply it
+        # before summing tokens rather than scaling the final output.
+        value_factor = value_scale.repeat_interleave(groups, dim=1)
+        return torch.einsum(
+            "hqk,khd,kh->qhd", probabilities, expanded_value, value_factor
+        ).to(query.dtype)
     output = torch.einsum("hqk,khd->qhd", probabilities, expanded_value)
     value_factor = value_scale.repeat_interleave(groups, dim=0)
     value_view = value_factor.view(1, -1, 1) if granularity == "per_head" else value_factor.view(1, *value_factor.shape)

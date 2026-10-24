@@ -8,7 +8,8 @@ class QuantConfig:
     """Symmetric INT8 quantization configuration.
 
     Query quantization is per sequence tensor. KV quantization is either one
-    scale per KV head, or one scale per ``(kv_head, head_dim)`` channel.
+    scale per KV head, one per ``(kv_head, head_dim)`` channel, or one
+    per ``(token, kv_head)`` vector.
     ``per_channel`` reduces over tokens only, so its scale depends on the QK
     reduction axis and must be folded into Q before an INT8 GEMM.
     """
@@ -26,7 +27,7 @@ class QuantConfig:
             raise ValueError("eps must be positive")
         if self.q_granularity != "per_tensor":
             raise ValueError("only per_tensor query quantization is supported")
-        if self.kv_granularity not in ("per_head", "per_channel"):
-            raise ValueError("kv_granularity must be per_head or per_channel")
+        if self.kv_granularity not in ("per_head", "per_channel", "per_token_head"):
+            raise ValueError("kv_granularity must be per_head, per_channel, or per_token_head")
         if self.scale_statistic not in ("absmax", "p999"):
             raise ValueError("scale_statistic must be absmax or p999")

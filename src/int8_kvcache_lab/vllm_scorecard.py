@@ -27,8 +27,8 @@ def evaluation_groups(
     granularity: str, include_per_head: bool
 ) -> list[tuple[str, str | None, str]]:
     """Return the requested native/dequant/INT8-compute comparison groups."""
-    if granularity not in ("per_head", "per_channel"):
-        raise ValueError("granularity must be per_head or per_channel")
+    if granularity not in ("per_head", "per_channel", "per_token_head"):
+        raise ValueError("granularity must be per_head, per_channel, or per_token_head")
     groups = [
         ("native_fp", None, granularity),
         (f"{granularity}_int8_dequant", "dequant", granularity),
@@ -311,7 +311,7 @@ def _read_analysis_recommendation(path: str | None) -> tuple[str | None, str | N
     recommendation = report.get("recommendation", {})
     granularity = recommendation.get("kv_granularity")
     statistic = recommendation.get("scale_statistic")
-    if granularity not in ("per_head", "per_channel") or statistic not in ("absmax", "p999"):
+    if granularity not in ("per_head", "per_channel", "per_token_head") or statistic not in ("absmax", "p999"):
         raise ValueError(f"{path} is not a valid Stage-2 recommendation report")
     return granularity, statistic
 
@@ -335,8 +335,8 @@ def run_scorecard(
 
     if not tasks:
         raise ValueError("scorecard requires at least one task")
-    if granularity not in ("per_head", "per_channel"):
-        raise ValueError("granularity must be per_head or per_channel")
+    if granularity not in ("per_head", "per_channel", "per_token_head"):
+        raise ValueError("granularity must be per_head, per_channel, or per_token_head")
     if statistic not in ("absmax", "p999"):
         raise ValueError("statistic must be absmax or p999")
     if query_granularity not in ("per_head", "per_channel"):
@@ -453,7 +453,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--query-granularity", choices=("per_head", "per_channel"), default="per_head")
-    parser.add_argument("--granularity", choices=("per_head", "per_channel"))
+    parser.add_argument("--granularity", choices=("per_head", "per_channel", "per_token_head"))
     parser.add_argument("--statistic", choices=("absmax", "p999"))
     parser.add_argument(
         "--analysis-report",

@@ -21,7 +21,7 @@ from .quantization import INT8_MAX
 from .reporting import default_output_dir, to_jsonable, write_report
 
 
-_CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel")
+_CANDIDATES = ("per_tensor", "per_head", "per_token", "per_channel", "per_token_head")
 # A head whose largest channel is at least this many times its smallest
 # channel needs a scale that follows head_dim. 8x is a starting threshold,
 # not a property of the model.
@@ -94,6 +94,8 @@ def _scale_for(
         return _safe_scale(_reduce_magnitude(absolute, (2, 3), statistic), eps)[:, :, None, None]
     if granularity == "per_channel":
         return _safe_scale(_reduce_magnitude(absolute, (0,), statistic), eps)[None]
+    if granularity == "per_token_head":
+        return _safe_scale(_reduce_magnitude(absolute, (3,), statistic), eps)[..., None]
     raise ValueError(f"unsupported granularity: {granularity}")
 
 

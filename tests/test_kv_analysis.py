@@ -10,7 +10,7 @@ def test_analysis_reports_all_granularities_and_a_supported_recommendation():
     layers = [torch.randn(17, 2, 2, 8), torch.randn(17, 2, 2, 8) * 0.25]
     report = analyze_capture({"format": "test", "layers": layers}, relative_l2_target=0.02)
     assert report["layer_count"] == 2
-    assert set(report["candidates"]) == {"per_tensor", "per_head", "per_token", "per_channel"}
+    assert set(report["candidates"]) == {"per_tensor", "per_head", "per_token", "per_channel", "per_token_head"}
     assert report["recommendation"]["kv_granularity"] in report["candidates"]
     assert report["distribution"]["key"]["percentiles"]["absmax"] > 0
     assert len(report["distribution"]["value"]["histogram"]["bins"]) == 64

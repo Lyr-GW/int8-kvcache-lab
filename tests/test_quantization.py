@@ -2,6 +2,7 @@ import torch
 
 from int8_kvcache_lab.quantization import (
     dequantize_int8,
+    logical_kv_scale,
     per_channel_scale,
     per_head_scale,
     per_tensor_scale,
@@ -32,3 +33,11 @@ def test_per_channel_scale_follows_head_dim_and_ignores_invalid_slots():
     mask = torch.tensor([[True, False]])
     scale = per_channel_scale(values, mask)
     torch.testing.assert_close(scale, torch.tensor([[1.0, 1.0 / 127]]))
+
+
+def test_per_token_head_and_per_channel_keep_different_axes():
+    values = torch.tensor([[[1.0, 127.0]], [[64.0, 2.0]]])
+    token_head = logical_kv_scale(values, granularity="per_token_head")
+    channel = logical_kv_scale(values, granularity="per_channel")
+    torch.testing.assert_close(token_head, torch.tensor([[1.0], [64.0 / 127]]))
+    torch.testing.assert_close(channel, torch.tensor([[64.0 / 127, 1.0]]))

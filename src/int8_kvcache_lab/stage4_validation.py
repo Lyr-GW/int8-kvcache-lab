@@ -40,7 +40,7 @@ def validate_capture(capture: dict[str, Any], *, statistic: str = "absmax") -> d
                 continue
             query = layer["query"]
             native = _output_as_heads(layer["output"], query)
-            for kv_granularity in ("per_head", "per_channel"):
+            for kv_granularity in ("per_head", "per_channel", "per_token_head"):
                 dequant = ref_paged_attn_quantized(
                     query,
                     layer["key_cache"],
