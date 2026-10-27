@@ -223,7 +223,11 @@ def replace_varlen_with_pytorch(
         causal = kwargs.get("causal")
         block_table = kwargs.get("block_table")
         window = kwargs.get("window_size")
-        uses_window = window not in (None, (-1, -1))
+        # vLLM passes the unbounded window as a list, whereas callers may also
+        # use a tuple. Both forms represent the same full-attention semantics.
+        uses_window = window is not None and not (
+            isinstance(window, (list, tuple)) and tuple(window) == (-1, -1)
+        )
         if block_table is None or not isinstance(causal, bool) or uses_window:
             increment_call_stat("native_fallback_calls")
             return original(**kwargs)
