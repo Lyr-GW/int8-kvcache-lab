@@ -128,6 +128,24 @@ for kv_granularity in ("per_channel", "per_token_head"):
     subprocess.run(command, check=True)
 
 # %% [markdown]
+# ## Small public MMLU sample
+#
+# Ten fixed-seed MMLU test rows exercise the full model. This small sample
+# is a diagnostic, not a reliable estimate of benchmark accuracy.
+
+# %%
+for kv_granularity in ("per_channel", "per_token_head"):
+    stage = f"stage5_mmlu10_q_per_tensor_kv_{kv_granularity}"
+    command = [
+        sys.executable, "-m", "int8_kvcache_lab.archive", "run",
+        "--output-dir", str(ARCHIVE_DIR), "--stage", stage, "--",
+        sys.executable, "scripts/run_mmlu_subset.py", "--model", MODEL,
+        "--granularity", kv_granularity, "--limit", "10", "--seed", "27",
+        "--output-dir", str(ARCHIVE_DIR),
+    ]
+    subprocess.run(command, check=True)
+
+# %% [markdown]
 # ## Stage 5 — end-to-end dynamic INT8 accuracy scorecard
 #
 # The same deterministic dataset samples run through both Q-scale choices:
