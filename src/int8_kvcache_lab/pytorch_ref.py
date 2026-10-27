@@ -164,7 +164,11 @@ def dequantized_attention(
     )
     if query_granularity is not None:
         query_scale = logical_query_scale(query, granularity=query_granularity, eps=eps)
-        query_view = query_scale.view(1, -1, 1) if query_granularity == "per_head" else query_scale.unsqueeze(0)
+        query_view = (
+            query_scale if query_granularity == "per_tensor"
+            else query_scale.view(1, -1, 1) if query_granularity == "per_head"
+            else query_scale.unsqueeze(0)
+        )
         query = (quantize_symmetric_int8(query, query_view).float() * query_view).to(query.dtype)
     key_view = _kv_scale_view(key_scale, granularity)
     value_view = _kv_scale_view(value_scale, granularity)
@@ -205,7 +209,11 @@ def int8_simulated_attention(
     groups = query.shape[1] // key.shape[1]
     if query_granularity is not None:
         query_scale = logical_query_scale(query, granularity=query_granularity, eps=eps)
-        query_view = query_scale.view(1, -1, 1) if query_granularity == "per_head" else query_scale.unsqueeze(0)
+        query_view = (
+            query_scale if query_granularity == "per_tensor"
+            else query_scale.view(1, -1, 1) if query_granularity == "per_head"
+            else query_scale.unsqueeze(0)
+        )
         query_i8 = quantize_symmetric_int8(query, query_view)
         key_factor = None
     elif independent_query_scale:
@@ -262,12 +270,12 @@ def int8_simulated_attention(
         else:
             logits = torch.einsum("qhd,khd->hqk", query_i8.float(), expanded_key)
             logits = logits * (query_scale * key_scale.repeat_interleave(groups, dim=0)).view(-1, 1, 1) * scale
-    elif independent_query_scale and granularity == "per_channel":
+    elif (independent_query_scale or query_granularity == "per_tensor") and granularity == "per_channel":
         expanded_key_scale = key_scale.repeat_interleave(groups, dim=0)
         logits = torch.einsum(
             "qhd,khd,hd->hqk", query_i8.float(), expanded_key, expanded_key_scale
         ) * query_scale * scale
-    elif independent_query_scale:
+    elif independent_query_scale or query_granularity == "per_tensor":
         expanded_key_scale = key_scale.repeat_interleave(groups, dim=0)
         logits = torch.einsum("qhd,khd->hqk", query_i8.float(), expanded_key)
         logits = logits * (query_scale * expanded_key_scale).view(-1, 1, 1) * scale

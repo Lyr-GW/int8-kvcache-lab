@@ -339,8 +339,8 @@ def run_scorecard(
         raise ValueError("granularity must be per_head, per_channel, or per_token_head")
     if statistic not in ("absmax", "p999"):
         raise ValueError("statistic must be absmax or p999")
-    if query_granularity not in ("per_head", "per_channel"):
-        raise ValueError("query_granularity must be per_head or per_channel")
+    if query_granularity not in ("per_tensor", "per_head", "per_channel"):
+        raise ValueError("query_granularity must be per_tensor, per_head, or per_channel")
     configure_worker_multiprocessing("fork")
     try:
         from vllm import SamplingParams
@@ -452,7 +452,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("half", "bfloat16"), default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--query-granularity", choices=("per_head", "per_channel"), default="per_head")
+    parser.add_argument("--query-granularity", choices=("per_tensor", "per_head", "per_channel"), default="per_head")
     parser.add_argument("--granularity", choices=("per_head", "per_channel", "per_token_head"))
     parser.add_argument("--statistic", choices=("absmax", "p999"))
     parser.add_argument(
@@ -481,7 +481,8 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens, granularity=granularity, statistic=statistic,
         include_per_head=args.include_per_head, output_dir=args.output_dir or str(default_output_dir()),
         query_granularity=args.query_granularity,
-        dataset_sampling="all rows" if args.all else f"seeded random sample, up to {args.limit} rows per suite",
+        dataset_sampling=("four synthetic smoke tasks" if args.dataset == "micro" else
+                          "all rows" if args.all else f"seeded random sample, up to {args.limit} rows per suite"),
     )
 
 

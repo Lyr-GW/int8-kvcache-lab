@@ -63,7 +63,7 @@ def test_per_token_head_scales_k_after_qk_and_v_before_pv():
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("query_granularity", ["per_head", "per_channel"])
+@pytest.mark.parametrize("query_granularity", ["per_tensor", "per_head", "per_channel"])
 def test_stage5_quantizes_query_by_selected_granularity_for_both_compute_paths(query_granularity):
     query, cache, table, lengths = _case(21)
     gathered_key, gathered_value, _ = cache.gather(table, lengths)
@@ -71,7 +71,7 @@ def test_stage5_quantizes_query_by_selected_granularity_for_both_compute_paths(q
     value = gathered_value[0, : int(lengths[0])]
 
     q_scale = logical_query_scale(query, granularity=query_granularity)
-    q_view = q_scale.view(1, -1, 1) if query_granularity == "per_head" else q_scale.unsqueeze(0)
+    q_view = q_scale if query_granularity == "per_tensor" else q_scale.view(1, -1, 1) if query_granularity == "per_head" else q_scale.unsqueeze(0)
     q_i8 = quantize_symmetric_int8(query, q_view)
     q_dequant = (q_i8.float() * q_view).to(query.dtype)
     expected_dequant = dequantized_attention(
@@ -89,3 +89,13 @@ def test_stage5_quantizes_query_by_selected_granularity_for_both_compute_paths(q
     torch.testing.assert_close(dequant, expected_dequant)
     assert torch.isfinite(dequant).all()
     assert torch.isfinite(simulated).all()
+
+
+@pytest.mark.parametrize("granularity", ["per_head", "per_channel", "per_token_head"])
+def test_per_tensor_query_matches_independent_query_scale(granularity):
+    query, cache, table, lengths = _case(19)
+    key, value, _ = cache.gather(table, lengths)
+    key, value = key[0, : int(lengths[0])], value[0, : int(lengths[0])]
+    explicit = int8_simulated_attention(query, key, value, granularity=granularity, query_granularity="per_tensor")
+    independent = int8_simulated_attention(query, key, value, granularity=granularity, independent_query_scale=True)
+    torch.testing.assert_close(explicit, independent)

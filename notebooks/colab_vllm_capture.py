@@ -104,6 +104,30 @@ STAGE2_REPORT = stage2_reports[-1]
 !python -m int8_kvcache_lab.archive register --output-dir {ARCHIVE_DIR} --path {ARCHIVE_DIR}/stage4-tests.xml --kind junit
 
 # %% [markdown]
+# ## Additional comparison — Q per-tensor, KV scale layout
+#
+# Keep Q per-tensor and absmax fixed; compare KV per-channel `[heads, dim]`
+# against per-token-head `[tokens, heads]`. Micro tasks check only that full
+# model generation runs through the selected paths; they are not benchmarks.
+
+# %%
+import subprocess
+import sys
+
+for kv_granularity in ("per_channel", "per_token_head"):
+    stage = f"stage5_micro_q_per_tensor_kv_{kv_granularity}"
+    command = [
+        sys.executable, "-m", "int8_kvcache_lab.archive", "run",
+        "--output-dir", str(ARCHIVE_DIR), "--stage", stage, "--",
+        sys.executable, "-m", "int8_kvcache_lab.vllm_scorecard",
+        "--model", MODEL, "--dataset", "micro", "--max-model-len", "256",
+        "--max-new-tokens", "32", "--query-granularity", "per_tensor",
+        "--granularity", kv_granularity, "--statistic", "absmax",
+        "--output-dir", str(ARCHIVE_DIR),
+    ]
+    subprocess.run(command, check=True)
+
+# %% [markdown]
 # ## Stage 5 — end-to-end dynamic INT8 accuracy scorecard
 #
 # The same deterministic dataset samples run through both Q-scale choices:

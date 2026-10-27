@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from int8_kvcache_lab import vllm_scorecard
 
 
@@ -38,7 +40,8 @@ def test_humaneval_completion_runs_in_isolated_grader():
     assert not vllm_scorecard.grade(item, "    return a\n")
 
 
-def test_scorecard_quantizes_query_and_reports_three_groups(monkeypatch, tmp_path):
+@pytest.mark.parametrize("query_granularity", ["per_head", "per_tensor"])
+def test_scorecard_quantizes_query_and_reports_three_groups(monkeypatch, tmp_path, query_granularity):
     import sys
 
     calls = []
@@ -70,10 +73,11 @@ def test_scorecard_quantizes_query_and_reports_three_groups(monkeypatch, tmp_pat
         model="fake", tasks=[{"suite": "aime", "prompt": "compute", "answer": "391", "kind": "integer"}],
         dtype="bfloat16", max_model_len=64, max_new_tokens=2, granularity="per_channel",
         statistic="absmax", include_per_head=False, output_dir=str(tmp_path),
+        query_granularity=query_granularity,
     )
 
     assert [name for name, _, _ in vllm_scorecard.evaluation_groups("per_channel", False)] == report["groups"]
-    assert all(kwargs["query_granularity"] == "per_head" for _, kwargs in calls)
+    assert all(kwargs["query_granularity"] == query_granularity for _, kwargs in calls)
     assert calls[0][0] == "dequant"
     assert calls[1][0] == "int8_gemm"
     assert all(row["correct"] for row in report["rows"])

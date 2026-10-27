@@ -60,7 +60,7 @@ def validate_capture(capture: dict[str, Any], *, statistic: str = "absmax") -> d
                     "layer": layer_index,
                     "vs_native": _metrics(dequant, native),
                 })
-                for query_granularity in ("per_head", "per_channel"):
+                for query_granularity in ("per_tensor", "per_head", "per_channel"):
                     output = ref_paged_attn_quantized(
                         query,
                         layer["key_cache"],
