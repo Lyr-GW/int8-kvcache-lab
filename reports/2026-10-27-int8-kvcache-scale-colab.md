@@ -58,6 +58,19 @@ Q 的 `per_tensor` 为一次调用的整个 Q 张量计算一个动态 scale；�
 
 相对于 5% 的输出误差实验门槛，`per_channel` 的 KV 反量化路径在本次 84 次调用中最大值低于门槛，`per_token_head` 超过门槛。加入 Q 量化后，即使 per-channel 最大值也超过 5%。某组加入 Q 量化后最大误差下降并不意味着 Q 量化必然改善精度：误差可能在单个样本中相互抵消。
 
+### 逐层分布和超门槛次数
+
+复核下载的 decode-only JSON，按 84 个层调用统计，5% 是本实验的相对 L2 门槛（不是行业通用标准）：
+
+| KV 粒度及 Q 路径 | 中位数 | 超过 5% 的调用数 | 观察 |
+|---|---:|---:|---|
+| per_channel，Q 浮点 | 1.339% | 0/84 | 本样本没有调用超门槛。 |
+| per_token_head，Q 浮点 | 1.932% | 6/84 | 6 次全部集中在 3 个 decode step 的第 0、1 层。 |
+| per_channel，Q per-tensor | 2.684% | 8/84 | 超门槛不仅出现在第 0 层。 |
+| per_token_head，Q per-tensor | 3.047% | 13/84 | Q 量化后，超门槛调用扩展到更多层。 |
+
+这里的 84 次来自一个 prompt 的 3 个连续 decode step 和 28 层，彼此并非独立样本，因此不能将上述比例外推成总体失效率。该分布表明，在本案例中值得分别研究早期层的 K 量化误差和 Q per-tensor 的影响。
+
 ### 最差层诊断
 
 所有上述最大误差来自第一个 decode 步骤、KV 长度 17 的第 0 层。以该层 PyTorch 浮点参考为比较基准，分别只量化 K、只量化 V、同时量化 K/V（Q 保持浮点）：
@@ -84,13 +97,13 @@ smoke 题只是算术、物理、编程、地理各 1 题，虽然输出表使�
 | per_token_head | 5/10 | 5/10 | 5/10 |
 | per_channel | 5/10 | 5/10 | 5/10 |
 
-四个量化组各记录 224 次 PyTorch 量化调用、0 次 fallback；计数包括模型预热。分数相同不能证明逐题输出完全相同，更不能证明在完整 MMLU 或其他任务上不存在精度损失。仅 10 条题目、输出长度上限和答案提取规则都会限制结论；应扩大样本、核对逐题答案及截断、增加多个 prompt 与模型再做判断。
+四个量化组各记录 224 次 PyTorch 量化调用、0 次 fallback；计数包括模型预热。进一步按 prompt 对齐逐题 completion：per-token-head 两条量化路径均与 native 10/10 完全相同；per-channel 两条量化路径均在行号 1071 由 native 的 B 变为 D，其他 9 题相同。该题两种答案都错误，因此尽管输出改变，三条路径仍都为 5/10。这正说明总分相同并不代表逐题输出完全相同，更不能证明在完整 MMLU 或其他任务上不存在精度损失。仅 10 条题目、输出长度上限和答案提取规则都会限制结论；应扩大样本、核对逐题答案及截断、增加多个 prompt 与模型再做判断。
 
 ## 结果文件与复现
 
 上述结果实际在 [Colab 运行会话](https://colab.research.google.com/drive/1C3YctDNXDAU4mussCqVlwIqNv0Y1ZlKj) 中通过终端执行；该会话所在 Notebook 出现自动保存冲突。另存的 [可复现 Notebook](https://colab.research.google.com/drive/1zzCG4KWUckp9VUiR-VQ9TfiElHvTysk3) 已保存新增步骤，但其单元格尚未整本运行，不应把它当作带有本次输出的运行记录。
 
-当次运行目录为 `/content/int8-kvcache-experiments/20261027T094313Z-49e274/`；其关键文件如下，目录随 Colab 运行时结束可能被清理。结果包 `/content/int8-kvcache-results.zip` 包含 JSON、日志和 decode-only 捕获，已从 Colab 文件面板触发浏览器下载；请在浏览器下载记录中确认保存位置。完整的原始捕获 `qwen-real-kv.pt` 不在结果包内。
+当次运行目录为 `/content/int8-kvcache-experiments/20261027T094313Z-49e274/`；其关键文件如下，目录随 Colab 运行时结束可能被清理。结果包包含 JSON、日志和 decode-only 捕获，已确认下载并校验完整性，工作区副本为 `reports/artifacts/2026-10-27/int8-kvcache-results.zip`；SHA-256 为 `8f7dcfb076b793f2b39ee35daf23649817271d5355b7f4a774680cf3d5795d96`。该 ZIP 未提交至 Git。完整的原始捕获 `qwen-real-kv.pt` 不在结果包内。
 
 - `vllm_kv_cache_calibration-20261027T095446761292Z.json`：KV 重建统计。
 - `stage3_replay-20261027T095514723081Z.json`：224 层次调用的 FP 重放。
